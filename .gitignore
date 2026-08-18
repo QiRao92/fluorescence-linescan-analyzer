@@ -1,0 +1,10 @@
+# This repository intentionally publishes only the standalone application.
+# Microscopy data, generated results, caches, and legacy analysis scripts stay local.
+*
+!.gitignore
+!README.md
+!README_GUI_中文.md
+!requirements.txt
+!hnf4a_linescan_gui.py
+!open_HNF4A_analyzer.bat
+!gui_interface_preview_v2.png
