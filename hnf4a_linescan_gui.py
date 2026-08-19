@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,7 +25,7 @@ from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 from matplotlib.widgets import RectangleSelector
 from PIL import Image, ImageDraw
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QPoint, Qt, Signal
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
@@ -36,10 +36,16 @@ from PySide6.QtGui import (
     QFontDatabase,
     QKeySequence,
     QPalette,
+    QPainter,
+    QPolygon,
 )
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QColorDialog,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -53,10 +59,13 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressDialog,
+    QProxyStyle,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSplitter,
     QStatusBar,
+    QStyle,
     QVBoxLayout,
     QWidget,
 )
@@ -65,11 +74,72 @@ from skimage.measure import profile_line
 
 
 APP_TITLE = "Fluorescence Line-scan Analyzer"
-HNF4A_COLOR = "#D55E00"
-DAPI_COLOR = "#0072B2"
 ROI_COLOR = "#FFD400"
 LINE_COLOR = "#FFFFFF"
 SUPPORTED_SUFFIXES = {".tif", ".tiff", ".png", ".bmp", ".jpg", ".jpeg"}
+CHANNEL_COLORS = (
+    "#D55E00",
+    "#0072B2",
+    "#009E73",
+    "#CC79A7",
+    "#E69F00",
+    "#56B4E9",
+    "#7A3E9D",
+    "#666666",
+)
+
+
+class VisibleSpinArrowStyle(QProxyStyle):
+    """Draw spin-box arrows explicitly so Windows theme colors cannot hide them."""
+
+    def drawPrimitive(self, element, option, painter, widget=None) -> None:  # noqa: N802
+        spin_elements = (
+            QStyle.PrimitiveElement.PE_IndicatorSpinUp,
+            QStyle.PrimitiveElement.PE_IndicatorSpinDown,
+        )
+        if element not in spin_elements:
+            super().drawPrimitive(element, option, painter, widget)
+            return
+        rect = option.rect
+        half_width = max(3, min(rect.width(), rect.height()) // 4)
+        center_x = rect.center().x()
+        center_y = rect.center().y()
+        if element == QStyle.PrimitiveElement.PE_IndicatorSpinUp:
+            points = QPolygon(
+                [
+                    QPoint(center_x - half_width, center_y + 2),
+                    QPoint(center_x + half_width, center_y + 2),
+                    QPoint(center_x, center_y - half_width + 1),
+                ]
+            )
+        else:
+            points = QPolygon(
+                [
+                    QPoint(center_x - half_width, center_y - 2),
+                    QPoint(center_x + half_width, center_y - 2),
+                    QPoint(center_x, center_y + half_width - 1),
+                ]
+            )
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(Qt.PenStyle.NoPen)
+        enabled = bool(option.state & QStyle.StateFlag.State_Enabled)
+        painter.setBrush(QColor("#334155" if enabled else "#94A3B8"))
+        painter.drawPolygon(points)
+        painter.restore()
+
+
+def set_color_button_style(button: QPushButton, color: str) -> None:
+    qt_color = QColor(color)
+    luminance = 0.299 * qt_color.red() + 0.587 * qt_color.green() + 0.114 * qt_color.blue()
+    text_color = "#111827" if luminance > 150 else "#FFFFFF"
+    button.setText(f"颜色  {color.upper()}")
+    button.setStyleSheet(
+        "QPushButton {"
+        f"background: {color}; color: {text_color}; border: 1px solid #64748B;"
+        "font-weight: 700; min-height: 28px; padding: 2px 8px;"
+        "}"
+    )
 
 
 def configure_fonts(app: QApplication) -> None:
@@ -102,7 +172,7 @@ def configure_fonts(app: QApplication) -> None:
 
 def configure_light_theme(app: QApplication) -> None:
     """Use deterministic light colors instead of inheriting Windows dark mode."""
-    app.setStyle("Fusion")
+    app.setStyle(VisibleSpinArrowStyle("Fusion"))
     palette = QPalette()
     colors = {
         QPalette.ColorRole.Window: "#F3F4F6",
@@ -178,9 +248,14 @@ def read_image_array(path: Path) -> np.ndarray:
     else:
         array = np.asarray(Image.open(path))
     array = np.asarray(array)
+    array = np.squeeze(array)
     while array.ndim > 3:
         array = array[0]
-    if array.ndim == 3 and array.shape[0] in (3, 4) and array.shape[-1] not in (3, 4):
+    if (
+        array.ndim == 3
+        and 1 <= array.shape[0] <= 16
+        and array.shape[-1] > 16
+    ):
         array = np.moveaxis(array, 0, -1)
     return array
 
@@ -213,19 +288,24 @@ def resize_float(array: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     return np.asarray(resized, dtype=np.float32)
 
 
-def sibling_channel_paths(composite: Path) -> tuple[Path, Path, Path] | None:
+def sibling_channel_paths(composite: Path) -> list[Path]:
     name = composite.name
-    if name.endswith("_s1c1-3.tif"):
-        prefix = name[: -len("_s1c1-3.tif")]
-        paths = tuple(composite.with_name(f"{prefix}_s1c{i}.tif") for i in (1, 2, 3))
-    elif name.endswith("_c1-3.tif"):
-        prefix = name[: -len("_c1-3.tif")]
-        paths = tuple(composite.with_name(f"{prefix}_c{i}.tif") for i in (1, 2, 3))
+    series_match = re.match(r"^(.*)_s1c1-3\.tiff?$", name, re.IGNORECASE)
+    channel_match = re.match(r"^(.*)_c1-3\.tiff?$", name, re.IGNORECASE)
+    if series_match:
+        prefix = series_match.group(1)
+        expression = re.compile(rf"^{re.escape(prefix)}_s1c(\d+)\.tiff?$", re.IGNORECASE)
+    elif channel_match:
+        prefix = channel_match.group(1)
+        expression = re.compile(rf"^{re.escape(prefix)}_c(\d+)\.tiff?$", re.IGNORECASE)
     else:
-        return None
-    if not all(path.exists() for path in paths):
-        return None
-    return paths  # type: ignore[return-value]
+        return []
+    matches: list[tuple[int, Path]] = []
+    for path in composite.parent.iterdir():
+        match = expression.match(path.name)
+        if match and path.is_file():
+            matches.append((int(match.group(1)), path))
+    return [path for _index, path in sorted(matches)]
 
 
 def parse_pixel_size(path: Path, image_width: int) -> tuple[float, str]:
@@ -248,94 +328,276 @@ def parse_pixel_size(path: Path, image_width: int) -> tuple[float, str]:
 
 
 @dataclass
+class SourceChannel:
+    key: str
+    label: str
+    color: str
+    data: np.ndarray
+    source_path: Path | None = None
+
+
+@dataclass
+class AnalysisChannel:
+    source_key: str
+    name: str = ""
+    color: str = "#0072B2"
+    profile: np.ndarray | None = field(default=None, repr=False)
+    profile_sd: np.ndarray | None = field(default=None, repr=False)
+
+
+class ChannelEditorDialog(QDialog):
+    def __init__(
+        self,
+        sources: list[SourceChannel],
+        used_source_keys: set[str],
+        existing: AnalysisChannel | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("编辑分析通道" if existing else "添加分析通道")
+        self.setModal(True)
+        self.setMinimumWidth(420)
+        self.selected_color = existing.color if existing else "#0072B2"
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 12)
+        form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.source_combo = QComboBox()
+        for source in sources:
+            if source.key not in used_source_keys or (
+                existing is not None and source.key == existing.source_key
+            ):
+                self.source_combo.addItem(source.label, source.key)
+        self.name_edit = QLineEdit(existing.name if existing else "")
+        self.name_edit.setPlaceholderText("输入通道名称")
+        self.color_button = QPushButton()
+        form.addRow("图像通道来源", self.source_combo)
+        form.addRow("通道名称", self.name_edit)
+        form.addRow("显示颜色", self.color_button)
+        layout.addLayout(form)
+
+        hint = QLabel("该颜色将同步用于主图伪彩色、曲线和导出图。")
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确定")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        layout.addWidget(buttons)
+
+        if existing is not None:
+            existing_index = self.source_combo.findData(existing.source_key)
+            self.source_combo.setCurrentIndex(max(0, existing_index))
+        elif self.source_combo.count():
+            first_source = next(
+                (source for source in sources if source.key == self.source_combo.currentData()),
+                None,
+            )
+            if first_source is not None:
+                self.selected_color = first_source.color
+        set_color_button_style(self.color_button, self.selected_color)
+
+        self.source_combo.currentIndexChanged.connect(self.source_changed)
+        self.color_button.clicked.connect(self.choose_color)
+        buttons.accepted.connect(self.validate_and_accept)
+        buttons.rejected.connect(self.reject)
+
+    def source_changed(self, _index: int = -1) -> None:
+        source_key = str(self.source_combo.currentData())
+        parent = self.parent()
+        if isinstance(parent, MainWindow):
+            record = parent.current_record
+            source = record.source_channel(source_key) if record else None
+            if source is not None:
+                self.selected_color = source.color
+                set_color_button_style(self.color_button, self.selected_color)
+
+    def choose_color(self) -> None:
+        selected = QColorDialog.getColor(
+            QColor(self.selected_color), self, "选择分析通道颜色"
+        )
+        if selected.isValid():
+            self.selected_color = selected.name().upper()
+            set_color_button_style(self.color_button, self.selected_color)
+
+    def validate_and_accept(self) -> None:
+        if not self.name_edit.text().strip():
+            QMessageBox.warning(self, "缺少通道名称", "请输入通道名称。")
+            self.name_edit.setFocus()
+            return
+        self.accept()
+
+    def values(self) -> tuple[str, str, str]:
+        return (
+            str(self.source_combo.currentData()),
+            self.name_edit.text().strip(),
+            self.selected_color,
+        )
+
+
+@dataclass
 class ImageRecord:
     path: Path
     name: str
-    signal1_name: str = "HNF4A"
-    signal2_name: str = "DAPI"
     pixel_size_um: float = 1.0
     pixel_source: str = "尚未读取"
     rgb: np.ndarray | None = None
-    factin: np.ndarray | None = None
-    hnf4a: np.ndarray | None = None
-    dapi: np.ndarray | None = None
+    source_channels: list[SourceChannel] = field(default_factory=list)
+    display_source_keys: set[str] = field(default_factory=set)
+    analysis_channels: list[AnalysisChannel] = field(default_factory=list)
     roi: tuple[int, int, int, int] | None = None
     line: tuple[float, float, float, float] | None = None
     distance_um: np.ndarray | None = None
-    hnf4a_profile: np.ndarray | None = None
-    dapi_profile: np.ndarray | None = None
     line_width_px: int | None = None
     analysis_line_width_um: float | None = None
     analysis_smoothing_sigma: float | None = None
     analysis_background_percentile: float | None = None
+    analysis_compute_sd: bool = False
     dirty: bool = True
 
     @property
     def loaded(self) -> bool:
-        return self.rgb is not None
+        return self.rgb is not None and bool(self.source_channels)
 
     @property
     def analyzed(self) -> bool:
-        return self.distance_um is not None
+        return (
+            self.distance_um is not None
+            and bool(self.analysis_channels)
+            and all(channel.profile is not None for channel in self.analysis_channels)
+        )
+
+    def source_channel(self, key: str) -> SourceChannel | None:
+        return next((channel for channel in self.source_channels if channel.key == key), None)
+
+    def invalidate_analysis(self) -> None:
+        self.distance_um = None
+        for channel in self.analysis_channels:
+            channel.profile = None
+            channel.profile_sd = None
+        self.line_width_px = None
+        self.dirty = True
 
     def release_images(self) -> None:
         self.rgb = None
-        self.factin = None
-        self.hnf4a = None
-        self.dapi = None
+        self.source_channels.clear()
+
+
+def _source_color(index: int, count: int, rgb_source: bool = False) -> str:
+    if rgb_source and count >= 3:
+        return ("#FF0000", "#00C853", "#0066FF")[index] if index < 3 else CHANNEL_COLORS[index % len(CHANNEL_COLORS)]
+    if count == 3:
+        return ("#00D5E8", "#FF3B30", "#0066FF")[index]
+    return CHANNEL_COLORS[index % len(CHANNEL_COLORS)]
+
+
+def _array_channels(array: np.ndarray) -> list[np.ndarray]:
+    values = np.asarray(array)
+    if values.ndim == 2:
+        return [np.asarray(values, dtype=np.float32)]
+    if values.ndim != 3:
+        raise ValueError(f"不支持的图像维度：{values.shape}")
+    return [np.asarray(values[..., index], dtype=np.float32) for index in range(values.shape[-1])]
 
 
 def load_record_images(record: ImageRecord) -> None:
+    previous_display_keys = set(record.display_source_keys)
     composite_array = read_image_array(record.path)
     record.rgb = as_rgb(composite_array)
     height, width = record.rgb.shape[:2]
+    source_channels: list[SourceChannel] = []
     channel_files = sibling_channel_paths(record.path)
     if channel_files:
-        factin_path, hnf4a_path, dapi_path = channel_files
-        record.factin = resize_float(as_intensity(read_image_array(factin_path)), (height, width))
-        record.hnf4a = resize_float(as_intensity(read_image_array(hnf4a_path)), (height, width))
-        record.dapi = resize_float(as_intensity(read_image_array(dapi_path)), (height, width))
-    else:
-        raw = np.asarray(composite_array)
-        if raw.ndim == 2:
-            gray = resize_float(as_intensity(raw), (height, width))
-            record.factin = np.zeros_like(gray)
-            record.hnf4a = gray.copy()
-            record.dapi = gray.copy()
-        else:
-            raw_rgb = np.asarray(raw[..., :3], dtype=np.float32)
-            raw_rgb = np.stack(
-                [resize_float(raw_rgb[..., index], (height, width)) for index in range(3)],
-                axis=-1,
+        count = len(channel_files)
+        for index, channel_path in enumerate(channel_files):
+            channel_number_match = re.search(r"c(\d+)\.tiff?$", channel_path.name, re.IGNORECASE)
+            channel_number = channel_number_match.group(1) if channel_number_match else str(index + 1)
+            source_channels.append(
+                SourceChannel(
+                    key=f"c{channel_number}",
+                    label=f"c{channel_number}",
+                    color=_source_color(index, count),
+                    data=resize_float(
+                        as_intensity(read_image_array(channel_path)), (height, width)
+                    ),
+                    source_path=channel_path,
+                )
             )
-            record.hnf4a = raw_rgb[..., 0]
-            record.factin = raw_rgb[..., 1]
-            record.dapi = raw_rgb[..., 2]
+    else:
+        raw_channels = _array_channels(composite_array)
+        count = len(raw_channels)
+        rgb_labels = ("R（红）", "G（绿）", "B（蓝）")
+        for index, values in enumerate(raw_channels):
+            if count == 3:
+                key = ("R", "G", "B")[index]
+                label = rgb_labels[index]
+            elif count == 1:
+                key = "Gray"
+                label = "灰度通道"
+            else:
+                key = f"Ch{index + 1}"
+                label = f"通道 {index + 1}"
+            source_channels.append(
+                SourceChannel(
+                    key=key,
+                    label=label,
+                    color="#FFFFFF" if count == 1 else _source_color(index, count, rgb_source=True),
+                    data=resize_float(values, (height, width)),
+                    source_path=record.path,
+                )
+            )
+    record.source_channels = source_channels
+    valid_keys = {channel.key for channel in source_channels}
+    record.display_source_keys = (
+        previous_display_keys & valid_keys if previous_display_keys & valid_keys else valid_keys
+    )
+    record.analysis_channels = [
+        channel for channel in record.analysis_channels if channel.source_key in valid_keys
+    ]
     if record.pixel_source == "尚未读取":
         record.pixel_size_um, record.pixel_source = parse_pixel_size(record.path, width)
 
 
+def hex_to_rgb(color: str) -> tuple[int, int, int]:
+    value = color.lstrip("#")
+    return tuple(int(value[index : index + 2], 16) for index in (0, 2, 4))  # type: ignore[return-value]
+
+
 def composite_from_channels(
     record: ImageRecord,
-    show_factin: bool,
-    show_hnf4a: bool,
-    show_dapi: bool,
+    visible_source_keys: set[str] | None = None,
 ) -> np.ndarray:
     assert record.rgb is not None
-    if show_factin and show_hnf4a and show_dapi:
-        return record.rgb
-    assert record.factin is not None and record.hnf4a is not None and record.dapi is not None
-    shape = record.factin.shape
-    output = np.zeros((*shape, 3), dtype=np.uint8)
-    if show_hnf4a:
-        output[..., 0] = np.maximum(output[..., 0], normalize_uint8(record.hnf4a))
-    if show_factin:
-        factin = normalize_uint8(record.factin)
-        output[..., 1] = np.maximum(output[..., 1], factin)
-        output[..., 2] = np.maximum(output[..., 2], factin)
-    if show_dapi:
-        output[..., 2] = np.maximum(output[..., 2], normalize_uint8(record.dapi))
+    selected = visible_source_keys if visible_source_keys is not None else record.display_source_keys
+    height, width = record.rgb.shape[:2]
+    output = np.zeros((height, width, 3), dtype=np.uint8)
+    for channel in record.source_channels:
+        if channel.key not in selected:
+            continue
+        intensity = normalize_uint8(channel.data).astype(np.float32) / 255.0
+        color = hex_to_rgb(channel.color)
+        for component, value in enumerate(color):
+            contribution = np.round(intensity * value).astype(np.uint8)
+            output[..., component] = np.maximum(output[..., component], contribution)
     return output
+
+
+def validate_analysis_channels(record: ImageRecord) -> None:
+    if not record.analysis_channels:
+        raise ValueError("请先点击“添加分析通道”，选择来源并输入信号名称。")
+    names = [channel.name.strip() for channel in record.analysis_channels]
+    if any(not name for name in names):
+        raise ValueError("每个分析通道都必须由操作者输入信号名称。")
+    if len(set(names)) != len(names):
+        raise ValueError("分析通道名称不能重复。")
+    source_keys = [channel.source_key for channel in record.analysis_channels]
+    if len(set(source_keys)) != len(source_keys):
+        raise ValueError("同一个图像通道只能添加一次。")
+    if any(record.source_channel(key) is None for key in source_keys):
+        raise ValueError("分析通道来源已经失效，请重新选择。")
 
 
 def analyze_record(
@@ -343,60 +605,62 @@ def analyze_record(
     line_width_um: float,
     smoothing_sigma: float,
     background_percentile: float,
+    compute_sd: bool = False,
 ) -> None:
     if not record.loaded:
         load_record_images(record)
     if record.roi is None:
-        raise ValueError("请先框选 ROI。")
+        raise ValueError("请先生成并调整 ROI。")
     if record.line is None:
         raise ValueError("请先在 ROI 内画扫描线。")
-    assert record.hnf4a is not None and record.dapi is not None
+    validate_analysis_channels(record)
     x0, y0, width, height = record.roi
     x1, y1, x2, y2 = record.line
     if math.hypot(x2 - x1, y2 - y1) < 2:
         raise ValueError("扫描线太短，请重新绘制。")
     line_width_px = max(1, int(round(line_width_um / record.pixel_size_um)))
-    hnf4a_profile = profile_line(
-        record.hnf4a,
-        (y1, x1),
-        (y2, x2),
-        linewidth=line_width_px,
-        mode="constant",
-        cval=0,
-        reduce_func=np.mean,
-    ).astype(float)
-    dapi_profile = profile_line(
-        record.dapi,
-        (y1, x1),
-        (y2, x2),
-        linewidth=line_width_px,
-        mode="constant",
-        cval=0,
-        reduce_func=np.mean,
-    ).astype(float)
-    if smoothing_sigma > 0:
-        hnf4a_profile = gaussian_filter1d(hnf4a_profile, sigma=smoothing_sigma)
-        dapi_profile = gaussian_filter1d(dapi_profile, sigma=smoothing_sigma)
-    if background_percentile > 0:
-        h_crop = record.hnf4a[y0 : y0 + height, x0 : x0 + width]
-        d_crop = record.dapi[y0 : y0 + height, x0 : x0 + width]
-        hnf4a_profile = np.clip(
-            hnf4a_profile - np.percentile(h_crop, background_percentile), 0, None
+    profile_length = 0
+    for analysis_channel in record.analysis_channels:
+        source = record.source_channel(analysis_channel.source_key)
+        assert source is not None
+        samples = profile_line(
+            source.data,
+            (y1, x1),
+            (y2, x2),
+            linewidth=line_width_px,
+            mode="constant",
+            cval=0,
+            reduce_func=None,
+        ).astype(float)
+        samples = np.atleast_2d(samples.T).T
+        values = samples.mean(axis=1)
+        deviations = (
+            samples.std(axis=1, ddof=1)
+            if compute_sd and samples.shape[1] > 1
+            else None
         )
-        dapi_profile = np.clip(
-            dapi_profile - np.percentile(d_crop, background_percentile), 0, None
-        )
+        if smoothing_sigma > 0:
+            values = gaussian_filter1d(values, sigma=smoothing_sigma)
+            if deviations is not None:
+                deviations = gaussian_filter1d(deviations, sigma=smoothing_sigma)
+        if background_percentile > 0:
+            crop = source.data[y0 : y0 + height, x0 : x0 + width]
+            values = np.clip(
+                values - np.percentile(crop, background_percentile), 0, None
+            )
+        analysis_channel.profile = values
+        analysis_channel.profile_sd = deviations
+        profile_length = len(values)
     record.distance_um = np.linspace(
         0,
         math.hypot(x2 - x1, y2 - y1) * record.pixel_size_um,
-        len(hnf4a_profile),
+        profile_length,
     )
-    record.hnf4a_profile = hnf4a_profile
-    record.dapi_profile = dapi_profile
     record.line_width_px = line_width_px
     record.analysis_line_width_um = line_width_um
     record.analysis_smoothing_sigma = smoothing_sigma
     record.analysis_background_percentile = background_percentile
+    record.analysis_compute_sd = compute_sd
     record.dirty = False
 
 
@@ -432,7 +696,10 @@ def draw_dashed_line(
 
 def make_overlay(record: ImageRecord) -> Image.Image:
     assert record.rgb is not None and record.roi is not None and record.line is not None
-    image = Image.fromarray(record.rgb, mode="RGB")
+    display = composite_from_channels(
+        record, {channel.key for channel in record.source_channels}
+    )
+    image = Image.fromarray(display, mode="RGB")
     draw = ImageDraw.Draw(image)
     x, y, width, height = record.roi
     stroke = max(3, int(round(image.width / 700)))
@@ -488,34 +755,43 @@ def add_roi_scan_line(image: Image.Image, record: ImageRecord) -> Image.Image:
 
 def make_roi_channel_images(record: ImageRecord) -> dict[str, Image.Image]:
     assert record.rgb is not None
-    assert record.factin is not None and record.hnf4a is not None and record.dapi is not None
     assert record.roi is not None
     x, y, width, height = record.roi
-    composite = Image.fromarray(record.rgb[y : y + height, x : x + width], mode="RGB")
-    factin = colorize_channel(record.factin[y : y + height, x : x + width], (0, 255, 255))
-    signal1 = colorize_channel(record.hnf4a[y : y + height, x : x + width], (255, 0, 0))
-    signal2 = colorize_channel(record.dapi[y : y + height, x : x + width], (0, 0, 255))
-    return {
-        "composite": composite,
-        "factin": factin,
-        "signal1": signal1,
-        "signal2": signal2,
-    }
+    full_composite = composite_from_channels(
+        record, {channel.key for channel in record.source_channels}
+    )
+    composite = Image.fromarray(
+        full_composite[y : y + height, x : x + width], mode="RGB"
+    )
+    images = {"composite": composite}
+    for index, analysis_channel in enumerate(record.analysis_channels, start=1):
+        source = record.source_channel(analysis_channel.source_key)
+        assert source is not None
+        images[f"channel_{index}"] = colorize_channel(
+            source.data[y : y + height, x : x + width],
+            hex_to_rgb(analysis_channel.color),
+        )
+    return images
 
 
 def make_channel_panel(
     record: ImageRecord,
     roi_images: dict[str, Image.Image],
 ) -> Figure:
-    panel = Figure(figsize=(8.0, 7.2), facecolor="white", constrained_layout=True)
-    entries = [
-        ("composite", "Composite", "black"),
-        ("factin", "F-actin", "#008B8B"),
-        ("signal1", record.signal1_name, HNF4A_COLOR),
-        ("signal2", record.signal2_name, DAPI_COLOR),
-    ]
+    entries = [("composite", "Composite", "black")]
+    entries.extend(
+        (f"channel_{index}", channel.name, channel.color)
+        for index, channel in enumerate(record.analysis_channels, start=1)
+    )
+    columns = min(3, max(1, math.ceil(math.sqrt(len(entries)))))
+    rows = math.ceil(len(entries) / columns)
+    panel = Figure(
+        figsize=(columns * 3.5, rows * 3.2),
+        facecolor="white",
+        constrained_layout=True,
+    )
     for index, (key, title, title_color) in enumerate(entries, start=1):
-        axis = panel.add_subplot(2, 2, index)
+        axis = panel.add_subplot(rows, columns, index)
         axis.imshow(add_roi_scan_line(roi_images[key], record))
         axis.set_axis_off()
         axis.set_title(title, color=title_color, fontsize=11, fontweight="bold")
@@ -523,25 +799,33 @@ def make_channel_panel(
     return panel
 
 
+def plot_profile_curves(axis, record: ImageRecord, lw: float = 1.6) -> None:
+    assert record.distance_um is not None
+    for channel in record.analysis_channels:
+        assert channel.profile is not None
+        if channel.profile_sd is not None:
+            axis.fill_between(
+                record.distance_um,
+                np.clip(channel.profile - channel.profile_sd, 0, None),
+                channel.profile + channel.profile_sd,
+                color=channel.color,
+                alpha=0.18,
+                lw=0,
+            )
+        axis.plot(
+            record.distance_um,
+            channel.profile,
+            color=channel.color,
+            lw=lw,
+            label=channel.name,
+        )
+
+
 def make_curve_figure(record: ImageRecord) -> Figure:
     assert record.distance_um is not None
-    assert record.hnf4a_profile is not None and record.dapi_profile is not None
     figure = Figure(figsize=(5.2, 3.5), facecolor="white", constrained_layout=True)
     axis = figure.add_subplot(111)
-    axis.plot(
-        record.distance_um,
-        record.dapi_profile,
-        color=DAPI_COLOR,
-        lw=1.6,
-        label=record.signal2_name,
-    )
-    axis.plot(
-        record.distance_um,
-        record.hnf4a_profile,
-        color=HNF4A_COLOR,
-        lw=1.6,
-        label=record.signal1_name,
-    )
+    plot_profile_curves(axis, record, lw=1.6)
     axis.set_xlim(0, max(1.0, float(record.distance_um[-1])))
     axis.set_ylim(bottom=0)
     axis.set_xlabel("Distance (µm)")
@@ -557,17 +841,17 @@ def export_record(record: ImageRecord, output_dir: Path) -> dict[str, Path]:
         raise ValueError("当前图像还没有完成分析。")
     if not record.loaded:
         load_record_images(record)
+    validate_analysis_channels(record)
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = safe_stem(record.path)
-    signal1_file_label = safe_label(record.signal1_name)
-    signal2_file_label = safe_label(record.signal2_name)
     csv_path = output_dir / f"{stem}_profile.csv"
     overlay_path = output_dir / f"{stem}_overlay.png"
     roi_composite_path = output_dir / f"{stem}_ROI_composite.png"
     roi_overlay_path = output_dir / f"{stem}_ROI_composite_overlay.png"
-    roi_factin_path = output_dir / f"{stem}_ROI_F-actin.png"
-    roi_signal1_path = output_dir / f"{stem}_ROI_{signal1_file_label}.png"
-    roi_signal2_path = output_dir / f"{stem}_ROI_{signal2_file_label}.png"
+    roi_channel_paths = [
+        output_dir / f"{stem}_ROI_{safe_label(channel.name)}.png"
+        for channel in record.analysis_channels
+    ]
     channel_panel_png = output_dir / f"{stem}_ROI_channels_panel.png"
     channel_panel_pdf = output_dir / f"{stem}_ROI_channels_panel.pdf"
     curve_png = output_dir / f"{stem}_curve.png"
@@ -576,23 +860,25 @@ def export_record(record: ImageRecord, output_dir: Path) -> dict[str, Path]:
     metadata_path = output_dir / f"{stem}_analysis.json"
 
     assert record.distance_um is not None
-    assert record.hnf4a_profile is not None and record.dapi_profile is not None
+    header = ["distance_um"]
+    columns: list[np.ndarray] = [record.distance_um]
+    for channel in record.analysis_channels:
+        header.append(f"{channel.name}_AU")
+        columns.append(channel.profile)
+        if channel.profile_sd is not None:
+            header.append(f"{channel.name}_SD")
+            columns.append(channel.profile_sd)
     with csv_path.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.writer(handle)
-        writer.writerow(
-            ["distance_um", f"{record.signal1_name}_AU", f"{record.signal2_name}_AU"]
-        )
-        writer.writerows(
-            zip(record.distance_um, record.hnf4a_profile, record.dapi_profile)
-        )
+        writer.writerow(header)
+        writer.writerows(zip(*columns))
 
     overlay = make_overlay(record)
     overlay.save(overlay_path, dpi=(300, 300))
     roi_images = make_roi_channel_images(record)
     roi_images["composite"].save(roi_composite_path, dpi=(300, 300))
-    roi_images["factin"].save(roi_factin_path, dpi=(300, 300))
-    roi_images["signal1"].save(roi_signal1_path, dpi=(300, 300))
-    roi_images["signal2"].save(roi_signal2_path, dpi=(300, 300))
+    for index, path in enumerate(roi_channel_paths, start=1):
+        roi_images[f"channel_{index}"].save(path, dpi=(300, 300))
     roi_overlay = add_roi_scan_line(roi_images["composite"], record)
     roi_overlay.save(roi_overlay_path, dpi=(300, 300))
     channel_panel = make_channel_panel(record, roi_images)
@@ -608,20 +894,7 @@ def export_record(record: ImageRecord, output_dir: Path) -> dict[str, Path]:
     image_axis.imshow(roi_overlay)
     image_axis.set_axis_off()
     image_axis.set_title(f"{record.name} — ROI", fontsize=10)
-    curve_axis.plot(
-        record.distance_um,
-        record.dapi_profile,
-        color=DAPI_COLOR,
-        lw=1.5,
-        label=record.signal2_name,
-    )
-    curve_axis.plot(
-        record.distance_um,
-        record.hnf4a_profile,
-        color=HNF4A_COLOR,
-        lw=1.5,
-        label=record.signal1_name,
-    )
+    plot_profile_curves(curve_axis, record, lw=1.5)
     curve_axis.set_xlim(0, max(1.0, float(record.distance_um[-1])))
     curve_axis.set_ylim(bottom=0)
     curve_axis.set_xlabel("Distance (µm)")
@@ -651,23 +924,33 @@ def export_record(record: ImageRecord, output_dir: Path) -> dict[str, Path]:
         "line_width_um": record.analysis_line_width_um,
         "smoothing_sigma": record.analysis_smoothing_sigma,
         "background_percentile": record.analysis_background_percentile,
+        "sd_enabled": record.analysis_compute_sd,
+        "sd_definition": (
+            "per-point sample SD (ddof=1) across the sampling strip width, "
+            "smoothed with the same sigma as the mean"
+            if record.analysis_compute_sd
+            else None
+        ),
         "coordinate_system": "full-resolution image pixels",
-        "signal_1_name": record.signal1_name,
-        "signal_1_source": "c2/red channel",
-        "signal_2_name": record.signal2_name,
-        "signal_2_source": "c3/blue channel",
-        "display_channel_note": "c1/cyan=F-actin when sibling channels exist",
+        "analysis_channels": [
+            {
+                "name": channel.name,
+                "source_key": channel.source_key,
+                "plot_color": channel.color,
+                "source_file": str(source.source_path) if source and source.source_path else None,
+            }
+            for channel in record.analysis_channels
+            for source in [record.source_channel(channel.source_key)]
+        ],
+        "displayed_source_channels": sorted(record.display_source_keys),
         "note": "Exported pseudocolored TIFF intensities are descriptive A.U.; use raw CZI for rigorous between-sample quantification.",
     }
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
-    return {
+    exported = {
         "csv": csv_path,
         "full_overlay": overlay_path,
         "roi_composite": roi_composite_path,
         "roi_overlay": roi_overlay_path,
-        "roi_factin": roi_factin_path,
-        "roi_signal1": roi_signal1_path,
-        "roi_signal2": roi_signal2_path,
         "channel_panel_png": channel_panel_png,
         "channel_panel_pdf": channel_panel_pdf,
         "curve_png": curve_png,
@@ -675,6 +958,10 @@ def export_record(record: ImageRecord, output_dir: Path) -> dict[str, Path]:
         "panel": panel_png,
         "metadata": metadata_path,
     }
+    exported.update(
+        {f"roi_channel_{index}": path for index, path in enumerate(roi_channel_paths, start=1)}
+    )
+    return exported
 
 
 class ImageCanvas(FigureCanvasQTAgg):
@@ -689,30 +976,35 @@ class ImageCanvas(FigureCanvasQTAgg):
         self.axis.set_facecolor("#060A0F")
         self.figure.subplots_adjust(left=0.01, right=0.99, bottom=0.01, top=0.96)
         self.record: ImageRecord | None = None
-        self.show_factin = True
-        self.show_hnf4a = True
-        self.show_dapi = True
+        self.visible_source_keys: set[str] | None = None
         self.selector: RectangleSelector | None = None
         self.line_connection: int | None = None
         self.line_points: list[tuple[float, float]] = []
         self.mode = "idle"
         self.roi_snapshot: tuple | None = None
+        self.view: tuple[tuple[float, float], tuple[float, float]] | None = None
+        self._pan_start: tuple | None = None
         self.mpl_connect("key_press_event", self._on_key)
+        self.mpl_connect("scroll_event", self._on_scroll)
+        self.mpl_connect("button_press_event", self._on_pan_press)
+        self.mpl_connect("motion_notify_event", self._on_pan_motion)
+        self.mpl_connect("button_release_event", self._on_pan_release)
         self.render()
 
     def set_record(self, record: ImageRecord | None) -> None:
         self.cancel_mode()
+        if record is not self.record:
+            self.view = None
         self.record = record
+        self.visible_source_keys = set(record.display_source_keys) if record else None
         self.render()
 
-    def set_channels(self, factin: bool, hnf4a: bool, dapi: bool) -> None:
+    def set_visible_sources(self, source_keys: set[str]) -> None:
         if self.mode == "roi":
             self.finish_roi_edit(commit=True)
         elif self.mode == "line":
             self.cancel_mode()
-        self.show_factin = factin
-        self.show_hnf4a = hnf4a
-        self.show_dapi = dapi
+        self.visible_source_keys = set(source_keys)
         self.render()
 
     def render(self) -> None:
@@ -733,9 +1025,7 @@ class ImageCanvas(FigureCanvasQTAgg):
             self.axis.set_axis_off()
             self.draw_idle()
             return
-        display = composite_from_channels(
-            self.record, self.show_factin, self.show_hnf4a, self.show_dapi
-        )
+        display = composite_from_channels(self.record, self.visible_source_keys)
         self.axis.imshow(display)
         self.axis.set_axis_off()
         self.axis.set_title(self.record.name, color="white", fontsize=11, pad=8)
@@ -772,7 +1062,99 @@ class ImageCanvas(FigureCanvasQTAgg):
         if self.mode == "line" and self.line_points:
             px, py = self.line_points[0]
             self.axis.scatter([px], [py], s=35, c="white", edgecolors="black")
+        if self.view is not None:
+            self.axis.set_xlim(self.view[0])
+            self.axis.set_ylim(self.view[1])
         self.draw_idle()
+
+    def _full_extent(self) -> tuple[tuple[float, float], tuple[float, float]] | None:
+        if self.record is None or self.record.rgb is None:
+            return None
+        image_height, image_width = self.record.rgb.shape[:2]
+        return (-0.5, image_width - 0.5), (image_height - 0.5, -0.5)
+
+    def _apply_view(
+        self, xlim: tuple[float, float], ylim: tuple[float, float]
+    ) -> None:
+        extent = self._full_extent()
+        if extent is None:
+            return
+        (full_x0, full_x1), (full_y0, full_y1) = extent
+        span_x = min(xlim[1] - xlim[0], full_x1 - full_x0)
+        span_y = min(ylim[0] - ylim[1], full_y0 - full_y1)
+        x0 = float(np.clip(xlim[0], full_x0, full_x1 - span_x))
+        y1 = float(np.clip(ylim[1], full_y1, full_y0 - span_y))
+        if span_x >= full_x1 - full_x0 and span_y >= full_y0 - full_y1:
+            self.view = None
+            self.axis.set_xlim(full_x0, full_x1)
+            self.axis.set_ylim(full_y0, full_y1)
+        else:
+            self.view = ((x0, x0 + span_x), (y1 + span_y, y1))
+            self.axis.set_xlim(self.view[0])
+            self.axis.set_ylim(self.view[1])
+        self.draw_idle()
+
+    def reset_view(self) -> None:
+        if self.view is None:
+            return
+        self.view = None
+        extent = self._full_extent()
+        if extent is not None:
+            self.axis.set_xlim(extent[0])
+            self.axis.set_ylim(extent[1])
+            self.draw_idle()
+
+    def _on_scroll(self, event) -> None:
+        if (
+            self.record is None
+            or not self.record.loaded
+            or event.inaxes is not self.axis
+            or event.xdata is None
+            or event.ydata is None
+        ):
+            return
+        factor = 1 / 1.3 if event.button == "up" else 1.3
+        x0, x1 = self.axis.get_xlim()
+        y0, y1 = self.axis.get_ylim()
+        if factor < 1 and min(x1 - x0, y0 - y1) * factor < 20:
+            return
+        cx, cy = float(event.xdata), float(event.ydata)
+        self._apply_view(
+            (cx - (cx - x0) * factor, cx + (x1 - cx) * factor),
+            (cy + (y0 - cy) * factor, cy - (cy - y1) * factor),
+        )
+
+    def _on_pan_press(self, event) -> None:
+        if self.record is None or not self.record.loaded or event.inaxes is not self.axis:
+            return
+        if event.button == 1 and self.mode == "idle" and event.dblclick:
+            self.reset_view()
+            return
+        pannable = event.button == 2 or (event.button == 1 and self.mode == "idle")
+        if pannable and self.view is not None:
+            self._pan_start = (
+                event.x,
+                event.y,
+                self.axis.get_xlim(),
+                self.axis.get_ylim(),
+            )
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def _on_pan_motion(self, event) -> None:
+        if self._pan_start is None:
+            return
+        press_x, press_y, (x0, x1), (y0, y1) = self._pan_start
+        bbox = self.axis.get_window_extent()
+        if bbox.width <= 0 or bbox.height <= 0:
+            return
+        dx = (event.x - press_x) * (x1 - x0) / bbox.width
+        dy = (event.y - press_y) * (y0 - y1) / bbox.height
+        self._apply_view((x0 - dx, x1 - dx), (y0 + dy, y1 + dy))
+
+    def _on_pan_release(self, event) -> None:
+        if self._pan_start is not None:
+            self._pan_start = None
+            self.unsetCursor()
 
     def cancel_mode(self) -> None:
         if self.selector is not None:
@@ -794,17 +1176,12 @@ class ImageCanvas(FigureCanvasQTAgg):
             self.record.roi,
             self.record.line,
             self.record.distance_um,
-            self.record.hnf4a_profile,
-            self.record.dapi_profile,
+            [channel.profile for channel in self.record.analysis_channels],
             self.record.line_width_px,
             self.record.dirty,
         )
         self.record.line = None
-        self.record.distance_um = None
-        self.record.hnf4a_profile = None
-        self.record.dapi_profile = None
-        self.record.line_width_px = None
-        self.record.dirty = True
+        self.record.invalidate_analysis()
         self.mode = "roi"
         self.render()
         self.selector = RectangleSelector(
@@ -851,10 +1228,7 @@ class ImageCanvas(FigureCanvasQTAgg):
         height = int(np.clip(round(y2 - y1), 2, image_height - y))
         self.record.roi = (x, y, width, height)
         self.record.line = None
-        self.record.distance_um = None
-        self.record.hnf4a_profile = None
-        self.record.dapi_profile = None
-        self.record.dirty = True
+        self.record.invalidate_analysis()
         if self.selector is not None:
             self.selector.extents = (x, x + width, y, y + height)
             self.selector.set_visible(True)
@@ -875,11 +1249,12 @@ class ImageCanvas(FigureCanvasQTAgg):
                 record.roi,
                 record.line,
                 record.distance_um,
-                record.hnf4a_profile,
-                record.dapi_profile,
+                profiles,
                 record.line_width_px,
                 record.dirty,
             ) = snapshot
+            for channel, profile in zip(record.analysis_channels, profiles):
+                channel.profile = profile
         self.roi_snapshot = None
         self.render()
         self.selection_changed.emit()
@@ -906,10 +1281,7 @@ class ImageCanvas(FigureCanvasQTAgg):
         y = int(np.clip(round(center_y - height / 2), 0, image_height - height))
         self.record.roi = (x, y, width, height)
         self.record.line = None
-        self.record.distance_um = None
-        self.record.hnf4a_profile = None
-        self.record.dapi_profile = None
-        self.record.dirty = True
+        self.record.invalidate_analysis()
         if self.mode == "roi" and self.selector is not None:
             self.selector.extents = (x, x + width, y, y + height)
             self.selector.set_visible(True)
@@ -956,10 +1328,7 @@ class ImageCanvas(FigureCanvasQTAgg):
                 self.render()
                 return
             self.record.line = (p1[0], p1[1], p2[0], p2[1])
-            self.record.distance_um = None
-            self.record.hnf4a_profile = None
-            self.record.dapi_profile = None
-            self.record.dirty = True
+            self.record.invalidate_analysis()
             self.cancel_mode()
             self.render()
             self.selection_changed.emit()
@@ -1007,22 +1376,8 @@ class CurveCanvas(FigureCanvasQTAgg):
             self.clear_plot()
             return
         assert record.distance_um is not None
-        assert record.hnf4a_profile is not None and record.dapi_profile is not None
         self.axis.clear()
-        self.axis.plot(
-            record.distance_um,
-            record.dapi_profile,
-            color=DAPI_COLOR,
-            lw=1.5,
-            label=record.signal2_name,
-        )
-        self.axis.plot(
-            record.distance_um,
-            record.hnf4a_profile,
-            color=HNF4A_COLOR,
-            lw=1.5,
-            label=record.signal1_name,
-        )
+        plot_profile_curves(self.axis, record, lw=1.5)
         self.axis.set_xlim(0, max(1.0, float(record.distance_um[-1])))
         self.axis.set_ylim(bottom=0)
         self.axis.set_xlabel("Distance (µm)")
@@ -1039,9 +1394,11 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.records: list[ImageRecord] = []
         self.last_export_dir: Path | None = None
+        self.analysis_row_widgets: list[dict[str, QWidget]] = []
+        self.display_channel_checks: dict[str, QCheckBox] = {}
         self.setWindowTitle(APP_TITLE)
         self.resize(1550, 920)
-        self.setMinimumSize(1180, 720)
+        self.setMinimumSize(920, 620)
         self.setAcceptDrops(True)
         self._build_ui()
         self._build_menu()
@@ -1060,13 +1417,14 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
         root_layout = QHBoxLayout(root)
         root_layout.setContentsMargins(8, 8, 8, 8)
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        root_layout.addWidget(splitter)
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.main_splitter.setChildrenCollapsible(False)
+        root_layout.addWidget(self.main_splitter)
 
         left_panel = QFrame()
         left_panel.setObjectName("sidePanel")
-        left_panel.setMinimumWidth(250)
-        left_panel.setMaximumWidth(320)
+        left_panel.setMinimumWidth(220)
+        left_panel.setMaximumWidth(330)
         left_layout = QVBoxLayout(left_panel)
         title = QLabel("荧光线扫描")
         title.setObjectName("appTitle")
@@ -1095,20 +1453,27 @@ class MainWindow(QMainWindow):
         self.file_info.setObjectName("infoBox")
         self.file_info.setWordWrap(True)
         left_layout.addWidget(self.file_info)
-        splitter.addWidget(left_panel)
+        self.main_splitter.addWidget(left_panel)
 
         center_panel = QWidget()
+        center_panel.setMinimumWidth(330)
         center_layout = QVBoxLayout(center_panel)
         center_layout.setContentsMargins(6, 0, 6, 0)
         image_header = QHBoxLayout()
         image_header.addWidget(QLabel("图像与 Overlay"))
-        image_header.addStretch(1)
-        self.factin_check = QCheckBox("F-actin")
-        self.hnf4a_check = QCheckBox("HNF4A")
-        self.dapi_check = QCheckBox("DAPI")
-        for checkbox in (self.factin_check, self.hnf4a_check, self.dapi_check):
-            checkbox.setChecked(True)
-            image_header.addWidget(checkbox)
+        self.display_channel_widget = QWidget()
+        self.display_channel_layout = QHBoxLayout(self.display_channel_widget)
+        self.display_channel_layout.setContentsMargins(4, 0, 4, 0)
+        self.display_channel_layout.setSpacing(10)
+        self.display_channel_layout.addStretch(1)
+        display_scroll = QScrollArea()
+        display_scroll.setWidgetResizable(True)
+        display_scroll.setWidget(self.display_channel_widget)
+        display_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        display_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        display_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        display_scroll.setFixedHeight(34)
+        image_header.addWidget(display_scroll, 1)
         center_layout.addLayout(image_header)
         self.image_canvas = ImageCanvas()
         self.image_toolbar = NavigationToolbar2QT(self.image_canvas, center_panel)
@@ -1118,18 +1483,29 @@ class MainWindow(QMainWindow):
         self.canvas_hint = QLabel("提示：滚轮缩放；工具栏可平移/复位；ROI 为黄色，扫描线为白色虚线。")
         self.canvas_hint.setObjectName("hint")
         center_layout.addWidget(self.canvas_hint)
-        splitter.addWidget(center_panel)
+        self.main_splitter.addWidget(center_panel)
 
         right_panel = QFrame()
         right_panel.setObjectName("sidePanel")
-        right_panel.setMinimumWidth(390)
-        right_panel.setMaximumWidth(520)
+        right_panel.setMinimumWidth(320)
         right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(8, 8, 8, 8)
+        right_layout.setSpacing(6)
+
+        self.right_scroll = QScrollArea()
+        self.right_scroll.setWidgetResizable(True)
+        self.right_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.right_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.right_scroll.setMinimumWidth(330)
+        self.right_scroll.setMaximumWidth(540)
+        self.right_scroll.setWidget(right_panel)
 
         parameters = QGroupBox("分析参数")
         parameter_form = QFormLayout(parameters)
         parameter_form.setContentsMargins(8, 8, 8, 6)
         parameter_form.setVerticalSpacing(3)
+        parameter_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         self.pixel_spin = QDoubleSpinBox()
         self.pixel_spin.setRange(0.000001, 1000)
         self.pixel_spin.setDecimals(6)
@@ -1149,19 +1525,33 @@ class MainWindow(QMainWindow):
         self.background_spin.setDecimals(1)
         self.background_spin.setSuffix(" %")
         self.background_spin.setValue(1.0)
-        self.signal1_edit = QLineEdit("HNF4A")
-        self.signal1_edit.setPlaceholderText("例如 HNF4A")
-        self.signal2_edit = QLineEdit("DAPI")
-        self.signal2_edit.setPlaceholderText("例如 DAPI")
-        self.apply_names_all_button = QPushButton("将信号名称应用到全部图片")
+        self.sd_check = QCheckBox("SD 误差带（均值 ± SD）")
+        self.sd_check.setToolTip(
+            "沿扫描带宽方向计算每个采样点的标准差；\n曲线显示半透明误差带，CSV 增加 *_SD 列。\n带宽为 1 px 时无法计算。"
+        )
         parameter_form.addRow("像素尺寸", self.pixel_spin)
         parameter_form.addRow("扫描带宽", self.width_spin)
         parameter_form.addRow("平滑 σ", self.smooth_spin)
         parameter_form.addRow("背景分位数", self.background_spin)
-        parameter_form.addRow("信号 1（红/c2）", self.signal1_edit)
-        parameter_form.addRow("信号 2（蓝/c3）", self.signal2_edit)
-        parameter_form.addRow(self.apply_names_all_button)
+        parameter_form.addRow(self.sd_check)
         right_layout.addWidget(parameters)
+
+        analysis_group = QGroupBox("分析通道")
+        analysis_layout = QVBoxLayout(analysis_group)
+        analysis_layout.setContentsMargins(8, 8, 8, 7)
+        analysis_layout.setSpacing(5)
+        analysis_hint = QLabel("点击添加后，在弹窗中设置来源、名称和颜色。")
+        analysis_hint.setObjectName("hint")
+        analysis_hint.setWordWrap(True)
+        analysis_layout.addWidget(analysis_hint)
+        self.analysis_rows_widget = QWidget()
+        self.analysis_rows_layout = QVBoxLayout(self.analysis_rows_widget)
+        self.analysis_rows_layout.setContentsMargins(0, 0, 0, 0)
+        self.analysis_rows_layout.setSpacing(4)
+        analysis_layout.addWidget(self.analysis_rows_widget)
+        self.add_analysis_channel_button = QPushButton("＋ 添加分析通道")
+        analysis_layout.addWidget(self.add_analysis_channel_button)
+        right_layout.addWidget(analysis_group)
 
         workflow = QGroupBox("操作流程")
         workflow_layout = QVBoxLayout(workflow)
@@ -1183,9 +1573,8 @@ class MainWindow(QMainWindow):
         self.roi_height_spin.setValue(90)
         roi_size_row.addWidget(self.roi_height_spin)
         workflow_layout.addLayout(roi_size_row)
-        self.apply_roi_size_button = QPushButton("应用输入的 ROI 长宽")
-        workflow_layout.addWidget(self.apply_roi_size_button)
-        self.roi_button = QPushButton("① 绘制 / 编辑 ROI")
+        self.roi_button = QPushButton("① 按输入尺寸生成可调 ROI 框")
+        self.roi_button.setToolTip("生成后可直接拖动框体移动，或拖动边/角控制点缩放")
         self.line_button = QPushButton("② 画扫描线（点击两个端点）")
         self.analyze_button = QPushButton("③ 生成曲线")
         self.analyze_button.setObjectName("primaryButton")
@@ -1217,14 +1606,18 @@ class MainWindow(QMainWindow):
         self.open_output_button = QPushButton("打开最近的导出文件夹")
         export_layout.addWidget(self.open_output_button)
         self.export_note = QLabel(
-            "导出：全图定位、ROI 合并图、各通道 ROI、通道四宫格、曲线、CSV 和参数 JSON"
+            "导出：全图定位、ROI 合并图、每个分析通道、动态通道面板、曲线、CSV 和参数 JSON"
         )
         self.export_note.setObjectName("hint")
         self.export_note.setWordWrap(True)
         export_layout.addWidget(self.export_note)
         right_layout.addWidget(export_group)
-        splitter.addWidget(right_panel)
-        splitter.setSizes([270, 820, 430])
+        right_layout.addStretch(1)
+        self.main_splitter.addWidget(self.right_scroll)
+        self.main_splitter.setSizes([260, 850, 420])
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setStretchFactor(2, 0)
 
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("准备就绪。请导入图像。")
@@ -1234,18 +1627,13 @@ class MainWindow(QMainWindow):
         self.image_list.currentRowChanged.connect(self.select_record)
         self.remove_button.clicked.connect(self.remove_current)
         self.clear_button.clicked.connect(self.clear_records)
-        self.factin_check.toggled.connect(self.update_channels)
-        self.hnf4a_check.toggled.connect(self.update_channels)
-        self.dapi_check.toggled.connect(self.update_channels)
         self.pixel_spin.valueChanged.connect(self.pixel_size_changed)
         self.width_spin.valueChanged.connect(self.parameters_changed)
         self.smooth_spin.valueChanged.connect(self.parameters_changed)
         self.background_spin.valueChanged.connect(self.parameters_changed)
-        self.signal1_edit.editingFinished.connect(self.signal_names_changed)
-        self.signal2_edit.editingFinished.connect(self.signal_names_changed)
-        self.apply_names_all_button.clicked.connect(self.apply_signal_names_to_all)
-        self.apply_roi_size_button.clicked.connect(self.apply_roi_size)
-        self.roi_button.clicked.connect(self.begin_roi)
+        self.sd_check.toggled.connect(self.parameters_changed)
+        self.add_analysis_channel_button.clicked.connect(self.add_analysis_channel)
+        self.roi_button.clicked.connect(self.create_or_edit_roi)
         self.line_button.clicked.connect(self.begin_line)
         self.analyze_button.clicked.connect(self.run_analysis)
         self.reset_roi_button.clicked.connect(self.clear_roi)
@@ -1293,6 +1681,9 @@ class MainWindow(QMainWindow):
             QMenu::item:disabled { color: #9CA3AF; }
             QMenu::separator { height: 1px; background: #E5E7EB; margin: 4px 8px; }
             QFrame#sidePanel { background: white; border: 1px solid #D1D5DB; border-radius: 8px; }
+            QFrame#channelRow { background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 5px; }
+            QScrollArea { background: transparent; border: none; }
+            QScrollArea > QWidget > QWidget { background: transparent; }
             QLabel { color: #111827; background: transparent; }
             QLabel#appTitle { font-size: 20px; font-weight: 700; color: #111827; }
             QLabel#subtitle, QLabel#hint { color: #6B7280; font-size: 11px; }
@@ -1310,9 +1701,9 @@ class MainWindow(QMainWindow):
             QListWidget { color: #111827; background: #FFFFFF; alternate-background-color: #F8FAFC; border: 1px solid #D1D5DB; border-radius: 5px; padding: 3px; }
             QListWidget::item { min-height: 29px; padding: 3px; }
             QListWidget::item:selected { background: #DCEFEA; color: #134E4A; }
-            QDoubleSpinBox, QLineEdit { color: #111827; background: #FFFFFF; selection-background-color: #0F766E; selection-color: #FFFFFF; border: 1px solid #CBD5E1; border-radius: 3px; padding: 2px 5px; min-height: 26px; }
-            QDoubleSpinBox:disabled, QLineEdit:disabled { color: #9CA3AF; background: #F3F4F6; }
-            QAbstractSpinBox::up-button, QAbstractSpinBox::down-button { background: #F1F5F9; border-left: 1px solid #CBD5E1; width: 18px; }
+            QDoubleSpinBox, QLineEdit, QComboBox { color: #111827; background: #FFFFFF; selection-background-color: #0F766E; selection-color: #FFFFFF; border: 1px solid #CBD5E1; border-radius: 3px; padding: 2px 5px; min-height: 26px; }
+            QDoubleSpinBox:disabled, QLineEdit:disabled, QComboBox:disabled { color: #9CA3AF; background: #F3F4F6; }
+            QComboBox::drop-down { border: none; width: 20px; }
             QToolBar { background: #F3F4F6; color: #111827; border: none; spacing: 3px; }
             QToolButton { color: #111827; background: transparent; border: 1px solid transparent; border-radius: 3px; padding: 3px; }
             QToolButton:hover { color: #111827; background: #E2E8F0; border-color: #CBD5E1; }
@@ -1334,17 +1725,23 @@ class MainWindow(QMainWindow):
             self.width_spin,
             self.smooth_spin,
             self.background_spin,
-            self.signal1_edit,
-            self.signal2_edit,
-            self.apply_names_all_button,
             self.roi_width_spin,
             self.roi_height_spin,
-            self.apply_roi_size_button,
             self.roi_button,
         ):
             widget.setEnabled(has_record)
+        used_sources = {channel.source_key for channel in record.analysis_channels} if record else set()
+        self.add_analysis_channel_button.setEnabled(
+            bool(
+                record
+                and any(source.key not in used_sources for source in record.source_channels)
+            )
+        )
+        for row in self.analysis_row_widgets:
+            for widget in row.values():
+                widget.setEnabled(has_record)
         self.line_button.setEnabled(has_roi)
-        self.analyze_button.setEnabled(has_line)
+        self.analyze_button.setEnabled(bool(has_line and record and record.analysis_channels))
         self.reset_roi_button.setEnabled(has_roi)
         self.reset_line_button.setEnabled(has_line)
         self.export_current_button.setEnabled(analyzed)
@@ -1387,12 +1784,7 @@ class MainWindow(QMainWindow):
                 continue
             if path in existing:
                 continue
-            record = ImageRecord(
-                path=path,
-                name=display_name(path),
-                signal1_name=self.signal1_edit.text().strip() or "Signal 1",
-                signal2_name=self.signal2_edit.text().strip() or "Signal 2",
-            )
+            record = ImageRecord(path=path, name=display_name(path))
             self.records.append(record)
             self.image_list.addItem(QListWidgetItem(record.name))
             self._refresh_list_item(len(self.records) - 1)
@@ -1437,6 +1829,8 @@ class MainWindow(QMainWindow):
         if not (0 <= row < len(self.records)):
             self.image_canvas.set_record(None)
             self.curve_canvas.clear_plot()
+            self.rebuild_display_channel_checks()
+            self.rebuild_analysis_channel_rows()
             self.file_info.setText("尚未导入图像")
             self._update_controls()
             return
@@ -1451,14 +1845,8 @@ class MainWindow(QMainWindow):
             self.pixel_spin.blockSignals(True)
             self.pixel_spin.setValue(record.pixel_size_um)
             self.pixel_spin.blockSignals(False)
-            self.signal1_edit.blockSignals(True)
-            self.signal2_edit.blockSignals(True)
-            self.signal1_edit.setText(record.signal1_name)
-            self.signal2_edit.setText(record.signal2_name)
-            self.signal1_edit.blockSignals(False)
-            self.signal2_edit.blockSignals(False)
-            self.hnf4a_check.setText(record.signal1_name)
-            self.dapi_check.setText(record.signal2_name)
+            self.rebuild_display_channel_checks()
+            self.rebuild_analysis_channel_rows()
             self.image_canvas.set_record(record)
             self.curve_canvas.show_record(record)
             self.sync_roi_inputs()
@@ -1494,12 +1882,190 @@ class MainWindow(QMainWindow):
         self.file_info.setText("尚未导入图像")
         self._update_controls()
 
+    def _clear_layout(self, layout: QVBoxLayout | QHBoxLayout) -> None:
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def rebuild_display_channel_checks(self) -> None:
+        self._clear_layout(self.display_channel_layout)
+        self.display_channel_checks.clear()
+        record = self.current_record
+        if record is None or not record.loaded:
+            placeholder = QLabel("导入图片后显示可用通道")
+            placeholder.setObjectName("hint")
+            self.display_channel_layout.addWidget(placeholder)
+        else:
+            for source in record.source_channels:
+                checkbox = QCheckBox(source.label)
+                checkbox.setChecked(source.key in record.display_source_keys)
+                checkbox.setStyleSheet(f"QCheckBox {{ color: {source.color}; font-weight: 600; }}")
+                checkbox.toggled.connect(self.update_channels)
+                self.display_channel_checks[source.key] = checkbox
+                self.display_channel_layout.addWidget(checkbox)
+        self.display_channel_layout.addStretch(1)
+
     def update_channels(self) -> None:
-        self.image_canvas.set_channels(
-            self.factin_check.isChecked(),
-            self.hnf4a_check.isChecked(),
-            self.dapi_check.isChecked(),
+        record = self.current_record
+        if record is None:
+            return
+        selected = {
+            key for key, checkbox in self.display_channel_checks.items() if checkbox.isChecked()
+        }
+        record.display_source_keys = selected
+        self.image_canvas.set_visible_sources(selected)
+
+    def rebuild_analysis_channel_rows(self) -> None:
+        self._clear_layout(self.analysis_rows_layout)
+        self.analysis_row_widgets.clear()
+        record = self.current_record
+        if record is None or not record.loaded:
+            empty = QLabel("请先导入并选择图像。")
+            empty.setObjectName("hint")
+            self.analysis_rows_layout.addWidget(empty)
+            return
+        if not record.analysis_channels:
+            empty = QLabel("尚未添加分析通道。")
+            empty.setObjectName("hint")
+            self.analysis_rows_layout.addWidget(empty)
+            return
+        for index, analysis_channel in enumerate(record.analysis_channels):
+            row_widget = QFrame()
+            row_widget.setObjectName("channelRow")
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(7, 4, 5, 4)
+            row_layout.setSpacing(6)
+            color_swatch = QLabel()
+            color_swatch.setFixedSize(16, 16)
+            color_swatch.setStyleSheet(
+                f"background: {analysis_channel.color}; border: 1px solid #64748B; border-radius: 8px;"
+            )
+            name_label = QLabel(analysis_channel.name)
+            name_label.setStyleSheet("font-weight: 700; color: #111827;")
+            source = record.source_channel(analysis_channel.source_key)
+            source_label = QLabel(source.label if source else analysis_channel.source_key)
+            source_label.setObjectName("hint")
+            edit_button = QPushButton("编辑")
+            edit_button.setMaximumWidth(52)
+            remove_button = QPushButton("删除")
+            remove_button.setMaximumWidth(52)
+            row_layout.addWidget(color_swatch)
+            row_layout.addWidget(name_label)
+            row_layout.addWidget(source_label)
+            row_layout.addStretch(1)
+            row_layout.addWidget(edit_button)
+            row_layout.addWidget(remove_button)
+            self.analysis_rows_layout.addWidget(row_widget)
+            self.analysis_row_widgets.append(
+                {
+                    "row": row_widget,
+                    "color": color_swatch,
+                    "name": name_label,
+                    "source": source_label,
+                    "edit": edit_button,
+                    "remove": remove_button,
+                }
+            )
+            edit_button.clicked.connect(
+                lambda _checked=False, row_index=index: self.edit_analysis_channel(row_index)
+            )
+            remove_button.clicked.connect(
+                lambda _checked=False, row_index=index: self.remove_analysis_channel(row_index)
+            )
+
+    def append_analysis_channel(self, source_key: str, name: str, color: str) -> None:
+        record = self.current_record
+        if record is None or record.source_channel(source_key) is None:
+            return
+        if any(channel.source_key == source_key for channel in record.analysis_channels):
+            raise ValueError("同一个图像通道只能添加一次。")
+        clean_name = name.strip()
+        if not clean_name:
+            raise ValueError("请输入通道名称。")
+        record.analysis_channels.append(
+            AnalysisChannel(source_key=source_key, name=clean_name, color=color.upper())
         )
+        source = record.source_channel(source_key)
+        if source is not None:
+            source.color = color.upper()
+        record.invalidate_analysis()
+        self.rebuild_analysis_channel_rows()
+        self.rebuild_display_channel_checks()
+        self.image_canvas.render()
+        self.curve_canvas.clear_plot()
+        self.update_file_info()
+        self._refresh_list_item(self.image_list.currentRow())
+        self._update_controls()
+
+    def add_analysis_channel(self, checked: bool = False) -> None:
+        del checked
+        record = self.current_record
+        if record is None or not record.loaded:
+            return
+        used = {channel.source_key for channel in record.analysis_channels}
+        source = next((item for item in record.source_channels if item.key not in used), None)
+        if source is None:
+            self.statusBar().showMessage("所有可用图像通道都已经加入分析。")
+            return
+        dialog = ChannelEditorDialog(
+            record.source_channels,
+            used_source_keys=used,
+            parent=self,
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.append_analysis_channel(*dialog.values())
+
+    def edit_analysis_channel(self, index: int) -> None:
+        record = self.current_record
+        if record is None or not (0 <= index < len(record.analysis_channels)):
+            return
+        channel = record.analysis_channels[index]
+        used = {
+            other.source_key
+            for other_index, other in enumerate(record.analysis_channels)
+            if other_index != index
+        }
+        dialog = ChannelEditorDialog(
+            record.source_channels,
+            used_source_keys=used,
+            existing=channel,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        source_key, name, color = dialog.values()
+        source_changed = channel.source_key != source_key
+        channel.source_key = source_key
+        channel.name = name
+        channel.color = color.upper()
+        source = record.source_channel(source_key)
+        if source is not None:
+            source.color = color.upper()
+        if source_changed:
+            record.invalidate_analysis()
+            self.curve_canvas.clear_plot()
+        else:
+            self.curve_canvas.show_record(record)
+        self.rebuild_analysis_channel_rows()
+        self.rebuild_display_channel_checks()
+        self.image_canvas.render()
+        self.update_file_info()
+        self._refresh_list_item(self.image_list.currentRow())
+        self._update_controls()
+
+    def remove_analysis_channel(self, index: int) -> None:
+        record = self.current_record
+        if record is None or not (0 <= index < len(record.analysis_channels)):
+            return
+        record.analysis_channels.pop(index)
+        record.invalidate_analysis()
+        self.rebuild_analysis_channel_rows()
+        self.curve_canvas.clear_plot()
+        self.update_file_info()
+        self._refresh_list_item(self.image_list.currentRow())
+        self._update_controls()
 
     def update_file_info(self) -> None:
         record = self.current_record
@@ -1507,44 +2073,15 @@ class MainWindow(QMainWindow):
             self.file_info.setText("尚未导入图像")
             return
         height, width = record.rgb.shape[:2]
-        channel_note = (
-            f"独立通道：c2={record.signal1_name}，c3={record.signal2_name}"
-            if sibling_channel_paths(record.path)
-            else f"RGB：红={record.signal1_name}，蓝={record.signal2_name}"
+        channel_note = "可用通道：" + "、".join(channel.label for channel in record.source_channels)
+        analysis_note = (
+            "分析：" + "、".join(channel.name or "（未命名）" for channel in record.analysis_channels)
+            if record.analysis_channels
+            else "分析：尚未添加通道"
         )
         self.file_info.setText(
             f"{record.name}\n{width} × {height} px\n"
-            f"{record.pixel_size_um:.6f} µm/px\n{record.pixel_source}\n{channel_note}"
-        )
-
-    def signal_names_changed(self) -> None:
-        record = self.current_record
-        if record is None:
-            return
-        signal1 = self.signal1_edit.text().strip() or "Signal 1"
-        signal2 = self.signal2_edit.text().strip() or "Signal 2"
-        self.signal1_edit.setText(signal1)
-        self.signal2_edit.setText(signal2)
-        record.signal1_name = signal1
-        record.signal2_name = signal2
-        self.hnf4a_check.setText(signal1)
-        self.dapi_check.setText(signal2)
-        self.curve_canvas.show_record(record)
-        self.update_file_info()
-        self.statusBar().showMessage(
-            f"信号名称已更新：红/c2 = {signal1}；蓝/c3 = {signal2}。"
-        )
-
-    def apply_signal_names_to_all(self) -> None:
-        self.signal_names_changed()
-        signal1 = self.signal1_edit.text().strip() or "Signal 1"
-        signal2 = self.signal2_edit.text().strip() or "Signal 2"
-        for record in self.records:
-            record.signal1_name = signal1
-            record.signal2_name = signal2
-        self.curve_canvas.show_record(self.current_record)
-        self.statusBar().showMessage(
-            f"已将信号名称应用到全部 {len(self.records)} 张图片。"
+            f"{record.pixel_size_um:.6f} µm/px\n{record.pixel_source}\n{channel_note}\n{analysis_note}"
         )
 
     def sync_roi_inputs(self) -> None:
@@ -1564,12 +2101,19 @@ class MainWindow(QMainWindow):
             self.roi_width_spin.value(), self.roi_height_spin.value()
         )
 
+    def create_or_edit_roi(self) -> None:
+        if self.image_canvas.mode == "roi":
+            self.image_canvas.finish_roi_edit(commit=True)
+            return
+        self.apply_roi_size()
+        self.image_canvas.start_roi()
+
     def canvas_mode_changed(self, mode: str) -> None:
         if mode == "roi":
             self.roi_button.setText("完成 ROI 编辑（Enter）")
             self.roi_button.setObjectName("primaryButton")
         else:
-            self.roi_button.setText("① 绘制 / 编辑 ROI")
+            self.roi_button.setText("① 按输入尺寸生成可调 ROI 框")
             self.roi_button.setObjectName("")
         self.roi_button.style().unpolish(self.roi_button)
         self.roi_button.style().polish(self.roi_button)
@@ -1580,10 +2124,7 @@ class MainWindow(QMainWindow):
             return
         record.pixel_size_um = value
         record.pixel_source = "用户在 UI 中设置"
-        record.distance_um = None
-        record.hnf4a_profile = None
-        record.dapi_profile = None
-        record.dirty = True
+        record.invalidate_analysis()
         self.image_canvas.render()
         self.sync_roi_inputs()
         self.update_file_info()
@@ -1594,20 +2135,11 @@ class MainWindow(QMainWindow):
     def parameters_changed(self) -> None:
         record = self.current_record
         if record is not None and record.analyzed:
-            record.distance_um = None
-            record.hnf4a_profile = None
-            record.dapi_profile = None
-            record.dirty = True
+            record.invalidate_analysis()
             self.curve_canvas.clear_plot()
             self._refresh_list_item(self.image_list.currentRow())
             self.statusBar().showMessage("参数已改变，请重新点击“生成曲线”。")
             self._update_controls()
-
-    def begin_roi(self) -> None:
-        if self.image_canvas.mode == "roi":
-            self.image_canvas.finish_roi_edit(commit=True)
-        else:
-            self.image_canvas.start_roi()
 
     def begin_line(self) -> None:
         self.image_canvas.start_line()
@@ -1625,10 +2157,7 @@ class MainWindow(QMainWindow):
             return
         record.roi = None
         record.line = None
-        record.distance_um = None
-        record.hnf4a_profile = None
-        record.dapi_profile = None
-        record.dirty = True
+        record.invalidate_analysis()
         self.image_canvas.cancel_mode()
         self.image_canvas.render()
         self.selection_changed()
@@ -1639,10 +2168,7 @@ class MainWindow(QMainWindow):
         if record is None:
             return
         record.line = None
-        record.distance_um = None
-        record.hnf4a_profile = None
-        record.dapi_profile = None
-        record.dirty = True
+        record.invalidate_analysis()
         self.image_canvas.cancel_mode()
         self.image_canvas.render()
         self.selection_changed()
@@ -1659,14 +2185,18 @@ class MainWindow(QMainWindow):
                 self.width_spin.value(),
                 self.smooth_spin.value(),
                 self.background_spin.value(),
+                compute_sd=self.sd_check.isChecked(),
             )
             self.curve_canvas.show_record(record)
             self._refresh_list_item(self.image_list.currentRow())
             self._update_controls()
-            self.statusBar().showMessage(
+            message = (
                 f"曲线已生成：{len(record.distance_um) if record.distance_um is not None else 0} 个采样点，"
                 f"扫描带宽 {record.line_width_px} px。"
             )
+            if self.sd_check.isChecked() and record.line_width_px == 1:
+                message += " 带宽只有 1 px，无法计算 SD，仅输出均值。"
+            self.statusBar().showMessage(message)
             return True
         except Exception as error:
             if not silent:
@@ -1744,12 +2274,14 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self,
             "使用说明",
-            "1. 导入合并 TIFF（若同目录存在 c1/c2/c3，软件会自动读取）。\n"
-            "2. 确认像素尺寸，并输入红/c2、蓝/c3信号的名称。\n"
-            "3. 点击“绘制/编辑 ROI”；拖动框内移动，拖动边角调整大小。\n"
-            "4. 需要精确尺寸时输入 ROI 宽和高，再点击“应用输入的 ROI 长宽”。\n"
+            "1. 导入图像；软件会识别 RGB、灰度或同目录的 c1/c2/c3 通道。\n"
+            "2. 确认像素尺寸，添加分析通道，选择来源、输入名称并按需设置颜色。\n"
+            "3. 输入 ROI 宽和高，点击“生成可调 ROI 框”。\n"
+            "4. 直接拖动框体移动，拖动边/角控制点缩放，按 Enter 完成。\n"
             "5. 点击“画扫描线”，在 ROI 内点击两个端点，然后生成曲线。\n"
-            "6. 导出全图定位、ROI 裁剪、各通道 ROI、曲线图和 CSV。\n\n"
+            "6. 导出全图定位、ROI 裁剪、每个分析通道、曲线图和 CSV。\n\n"
+            "视图缩放：滚轮以鼠标位置为中心放大/缩小；空闲状态下左键拖动平移，"
+            "双击复位；ROI/扫描线模式下可用中键拖动平移。\n\n"
             "提示：当前 ZEISS 导出的 8-bit 伪彩色通道适合展示性线扫描；"
             "严格的样本间强度比较应使用原始 CZI/16-bit 数据。",
         )
@@ -1784,12 +2316,28 @@ def run_self_test(image_path: Path) -> None:
     record = window.current_record
     if record is None or record.rgb is None:
         raise RuntimeError("self-test could not load the image")
-    window.signal1_edit.setText("Marker A")
-    window.signal2_edit.setText("Nuclear stain")
-    window.signal_names_changed()
+    if len(record.source_channels) < 2:
+        raise RuntimeError("self-test needs an image with at least two channels")
+    window.append_analysis_channel(
+        record.source_channels[0].key,
+        "Marker A",
+        record.source_channels[0].color,
+    )
+    window.append_analysis_channel(
+        record.source_channels[1].key,
+        "Nuclear stain",
+        record.source_channels[1].color,
+    )
+    window.resize(920, 620)
+    window.show()
+    QApplication.processEvents()
+    if min(window.main_splitter.sizes()) <= 0:
+        raise RuntimeError("self-test responsive splitter collapsed a panel")
+    if window.right_scroll.verticalScrollBar().maximum() <= 0:
+        raise RuntimeError("self-test responsive panel did not enable scrolling")
     window.roi_width_spin.setValue(70.0)
     window.roi_height_spin.setValue(50.0)
-    window.apply_roi_size()
+    window.create_or_edit_roi()
     if record.roi is None:
         raise RuntimeError("self-test ROI size input failed")
     _rx, _ry, input_width_px, input_height_px = record.roi
@@ -1797,7 +2345,6 @@ def run_self_test(image_path: Path) -> None:
         raise RuntimeError("self-test ROI width input was not applied")
     if abs(input_height_px * record.pixel_size_um - 50.0) > record.pixel_size_um:
         raise RuntimeError("self-test ROI height input was not applied")
-    window.image_canvas.start_roi()
     x, y, roi_width, roi_height = record.roi
     window.image_canvas._roi_selected(
         SimpleNamespace(xdata=x + 5, ydata=y + 5),
@@ -1815,6 +2362,33 @@ def run_self_test(image_path: Path) -> None:
     )
     if not window.run_analysis(silent=True):
         raise RuntimeError("self-test analysis failed")
+    if any(channel.profile_sd is not None for channel in record.analysis_channels):
+        raise RuntimeError("self-test SD computed although the option is off")
+    window.sd_check.setChecked(True)
+    if not window.run_analysis(silent=True):
+        raise RuntimeError("self-test SD analysis failed")
+    canvas = window.image_canvas
+    x, y, roi_width, roi_height = record.roi
+    canvas._on_scroll(
+        SimpleNamespace(
+            inaxes=canvas.axis,
+            xdata=x + roi_width / 2,
+            ydata=y + roi_height / 2,
+            button="up",
+        )
+    )
+    if canvas.view is None:
+        raise RuntimeError("self-test wheel zoom did not change the view")
+    canvas.render()
+    if abs(canvas.axis.get_xlim()[0] - canvas.view[0][0]) > 1e-6:
+        raise RuntimeError("self-test zoomed view was lost after render")
+    canvas.reset_view()
+    if canvas.view is not None:
+        raise RuntimeError("self-test view reset failed")
+    if record.line_width_px > 1 and any(
+        channel.profile_sd is None for channel in record.analysis_channels
+    ):
+        raise RuntimeError("self-test SD profiles missing")
     with tempfile.TemporaryDirectory(prefix="hnf4a_gui_test_") as folder:
         exported = export_record(record, Path(folder))
         missing = [path for path in exported.values() if not path.exists()]
@@ -1824,10 +2398,13 @@ def run_self_test(image_path: Path) -> None:
         metadata = json.loads(exported["metadata"].read_text(encoding="utf-8"))
         if "Marker A_AU" not in csv_header or "Nuclear stain_AU" not in csv_header:
             raise RuntimeError("self-test custom signal names missing from CSV")
-        if metadata.get("signal_1_name") != "Marker A":
+        if record.line_width_px > 1 and "Marker A_SD" not in csv_header:
+            raise RuntimeError("self-test SD columns missing from CSV")
+        channel_metadata = metadata.get("analysis_channels", [])
+        if not channel_metadata or channel_metadata[0].get("name") != "Marker A":
             raise RuntimeError("self-test custom signal names missing from metadata")
         expected_size = (record.roi[2], record.roi[3])
-        for key in ("roi_composite", "roi_overlay", "roi_factin", "roi_signal1", "roi_signal2"):
+        for key in ("roi_composite", "roi_overlay", "roi_channel_1", "roi_channel_2"):
             with Image.open(exported[key]) as roi_image:
                 if roi_image.size != expected_size:
                     raise RuntimeError(

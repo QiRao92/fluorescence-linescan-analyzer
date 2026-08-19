@@ -1,32 +1,27 @@
 # Fluorescence Line-scan Analyzer
 
-A desktop GUI for drawing and editing microscopy ROIs, extracting two-channel fluorescence line profiles, and exporting publication-ready ROI/channel panels.
+A desktop GUI for drawing and editing microscopy ROIs, extracting fluorescence line profiles from a user-defined number of channels, and exporting publication-ready ROI/channel panels.
 
 ![Application interface](gui_interface_preview_v2.png)
 
 ## Features
 
 - Import individual images or recursively load a folder.
-- Automatically detect ZEISS-exported `c1/c2/c3` sibling TIFF channels.
-- Draw, move, and resize an interactive rectangular ROI.
-- Enter exact ROI width and height in micrometres.
+- Automatically detect RGB, grayscale, multi-channel, and ZEISS-exported sibling TIFF channels.
+- Add analysis channels manually, select their image source, and enter every signal name yourself.
+- Choose a custom pseudocolor for each channel; the preview, curves, and exported channel images stay synchronized.
+- Enter an exact ROI width and height to create an immediately draggable/resizable rectangle.
 - Draw a line scan by selecting two endpoints inside the ROI.
-- Set custom names for the two analyzed signals.
+- Zoom the image with the mouse wheel (cursor-centered), pan by dragging (left button when idle, middle button in ROI/line mode), and double-click to fit.
+- Resize the application safely: side controls scroll instead of overlapping or collapsing.
 - Configure pixel calibration, sampling-strip width, smoothing, and background subtraction.
-- Preview the two intensity profiles directly in the application.
-- Export full-image QC overlays, cropped ROI images, individual channel images, a four-panel channel view, profile CSV, curves, and JSON metadata.
+- Optionally compute per-point SD across the sampling strip: curves gain a shaded mean ± SD band and the CSV gains `*_SD` columns.
+- Preview all selected intensity profiles directly in the application.
+- Export full-image QC overlays, cropped ROI images, one image per selected analysis channel, a dynamic channel panel, profile CSV, curves, and JSON metadata.
 
-## Channel convention
+## Channel workflow
 
-For ZEISS `c1-3.tif` exports, the default mapping is:
-
-- `c1`: F-actin display channel (cyan)
-- `c2`: Signal 1 / red channel
-- `c3`: Signal 2 / blue channel
-
-Signal names are editable in the GUI and are propagated to legends, CSV headers, filenames, channel panels, and metadata.
-
-For ordinary RGB files without sibling channel TIFFs, red is used as Signal 1, blue as Signal 2, and green for the F-actin preview.
+The software does not assign biological names to channels. After importing an image, it lists objective sources such as `R/G/B`, `c1/c2/c3`, or `Channel 1...n`. Click **Add analysis channel** to open a compact setup dialog, then choose a source, type a signal name, and select a color. The main interface keeps only a one-line summary for each configured channel. Add as many unique source channels as the image provides.
 
 ## Installation
 
@@ -56,8 +51,8 @@ python hnf4a_linescan_gui.py image1.tif image2.tif
 
 1. Import one or more composite images.
 2. Verify or enter the pixel size in `µm/px`.
-3. Enter the two signal names.
-4. Draw/edit an ROI, or enter exact ROI width and height.
+3. Add the required analysis channels, select each source, and type every signal name.
+4. Enter the ROI width and height, then create the draggable/resizable ROI.
 5. Select two scan-line endpoints inside the ROI.
 6. Generate the profiles and inspect the result.
 7. Export the current result or batch-export all analyzed images.
@@ -66,13 +61,12 @@ python hnf4a_linescan_gui.py image1.tif image2.tif
 
 Each analyzed image can produce:
 
-- `*_profile.csv`: distance and the two signal intensity profiles.
+- `*_profile.csv`: distance and all selected signal intensity profiles, plus `*_SD` columns when the SD option is enabled.
 - `*_overlay.png`: full-image ROI and line location.
 - `*_ROI_composite.png`: clean cropped composite ROI.
 - `*_ROI_composite_overlay.png`: cropped composite ROI with scan line.
-- `*_ROI_F-actin.png`: clean F-actin ROI.
-- `*_ROI_<signal>.png`: clean Signal 1 and Signal 2 ROIs.
-- `*_ROI_channels_panel.png/.pdf`: composite plus three channel views with the scan line.
+- `*_ROI_<signal>.png`: one clean ROI image for every selected analysis channel.
+- `*_ROI_channels_panel.png/.pdf`: a dynamically sized composite/channel panel with the scan line.
 - `*_curve.png/.pdf`: line-profile curves.
 - `*_analysis_panel.png`: cropped ROI and curve in one panel.
 - `*_analysis.json`: calibration, ROI, line, signal, and processing metadata.
