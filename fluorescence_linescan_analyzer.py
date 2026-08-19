@@ -2389,7 +2389,7 @@ def run_self_test(image_path: Path) -> None:
         channel.profile_sd is None for channel in record.analysis_channels
     ):
         raise RuntimeError("self-test SD profiles missing")
-    with tempfile.TemporaryDirectory(prefix="hnf4a_gui_test_") as folder:
+    with tempfile.TemporaryDirectory(prefix="linescan_analyzer_test_") as folder:
         exported = export_record(record, Path(folder))
         missing = [path for path in exported.values() if not path.exists()]
         if missing:
