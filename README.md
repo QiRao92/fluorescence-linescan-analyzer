@@ -35,16 +35,16 @@ python -m pip install -r requirements.txt
 
 ## Run
 
-On Windows, double-click `open_HNF4A_analyzer.bat`, or run:
+On Windows, double-click `open_Fluorescence_Linescan_Analyzer.bat`, or run:
 
 ```powershell
-python hnf4a_linescan_gui.py
+python fluorescence_linescan_analyzer.py
 ```
 
 Images can also be passed on the command line:
 
 ```powershell
-python hnf4a_linescan_gui.py image1.tif image2.tif
+python fluorescence_linescan_analyzer.py image1.tif image2.tif
 ```
 
 ## Workflow

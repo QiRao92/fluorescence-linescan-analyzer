@@ -5,6 +5,6 @@
 !README.md
 !README_GUI_中文.md
 !requirements.txt
-!hnf4a_linescan_gui.py
-!open_HNF4A_analyzer.bat
+!fluorescence_linescan_analyzer.py
+!open_Fluorescence_Linescan_Analyzer.bat
 !gui_interface_preview_v2.png
