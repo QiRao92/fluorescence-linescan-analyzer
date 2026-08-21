@@ -218,8 +218,7 @@ def display_name(path: Path) -> str:
     name = path.name
     name = name.replace("Experiment-26-", "")
     name = name.replace("-Airyscan Processing-", " / AS-")
-    name = name.replace("_s1c1-3.tif", "")
-    name = name.replace("_c1-3.tif", "")
+    name = re.sub(r"_(?:s\d+)?c1-\d+\.tiff?$", "", name, flags=re.IGNORECASE)
     return name
 
 
@@ -246,7 +245,12 @@ def read_image_array(path: Path) -> np.ndarray:
     if path.suffix.lower() in {".tif", ".tiff"}:
         array = tifffile.imread(path)
     else:
-        array = np.asarray(Image.open(path))
+        with Image.open(path) as image:
+            if image.mode in ("P", "CMYK", "RGBA"):
+                image = image.convert("RGB")
+            elif image.mode == "LA":
+                image = image.convert("L")
+            array = np.asarray(image)
     array = np.asarray(array)
     array = np.squeeze(array)
     while array.ndim > 3:
@@ -290,11 +294,13 @@ def resize_float(array: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
 
 def sibling_channel_paths(composite: Path) -> list[Path]:
     name = composite.name
-    series_match = re.match(r"^(.*)_s1c1-3\.tiff?$", name, re.IGNORECASE)
-    channel_match = re.match(r"^(.*)_c1-3\.tiff?$", name, re.IGNORECASE)
+    series_match = re.match(r"^(.*)_s(\d+)c1-\d+\.tiff?$", name, re.IGNORECASE)
+    channel_match = re.match(r"^(.*)_c1-\d+\.tiff?$", name, re.IGNORECASE)
     if series_match:
-        prefix = series_match.group(1)
-        expression = re.compile(rf"^{re.escape(prefix)}_s1c(\d+)\.tiff?$", re.IGNORECASE)
+        prefix, series = series_match.group(1), series_match.group(2)
+        expression = re.compile(
+            rf"^{re.escape(prefix)}_s{series}c(\d+)\.tiff?$", re.IGNORECASE
+        )
     elif channel_match:
         prefix = channel_match.group(1)
         expression = re.compile(rf"^{re.escape(prefix)}_c(\d+)\.tiff?$", re.IGNORECASE)
@@ -488,7 +494,7 @@ class ImageRecord:
 
 def _source_color(index: int, count: int, rgb_source: bool = False) -> str:
     if rgb_source and count >= 3:
-        return ("#FF0000", "#00C853", "#0066FF")[index] if index < 3 else CHANNEL_COLORS[index % len(CHANNEL_COLORS)]
+        return ("#FF0000", "#00FF00", "#0000FF")[index] if index < 3 else CHANNEL_COLORS[index % len(CHANNEL_COLORS)]
     if count == 3:
         return ("#00D5E8", "#FF3B30", "#0066FF")[index]
     return CHANNEL_COLORS[index % len(CHANNEL_COLORS)]
@@ -544,7 +550,7 @@ def load_record_images(record: ImageRecord) -> None:
                 SourceChannel(
                     key=key,
                     label=label,
-                    color="#FFFFFF" if count == 1 else _source_color(index, count, rgb_source=True),
+                    color="#FFFFFF" if count == 1 else _source_color(index, count, rgb_source=count == 3),
                     data=resize_float(values, (height, width)),
                     source_path=record.path,
                 )
@@ -1815,7 +1821,7 @@ class MainWindow(QMainWindow):
             for path in root.rglob("*")
             if path.is_file()
             and path.suffix.lower() in {".tif", ".tiff"}
-            and (path.name.endswith("c1-3.tif") or path.name.endswith("c1-3.tiff"))
+            and re.search(r"c1-\d+\.tiff?$", path.name, re.IGNORECASE)
         )
         if not composites:
             composites = sorted(
@@ -2295,7 +2301,11 @@ class MainWindow(QMainWindow):
         for url in event.mimeData().urls():
             path = Path(url.toLocalFile())
             if path.is_dir():
-                composites = sorted(path.rglob("*c1-3.tif"))
+                composites = sorted(
+                    p
+                    for p in path.rglob("*")
+                    if p.is_file() and re.search(r"c1-\d+\.tiff?$", p.name, re.IGNORECASE)
+                )
                 paths.extend(composites or [p for p in path.rglob("*") if p.suffix.lower() in SUPPORTED_SUFFIXES])
             else:
                 paths.append(path)
