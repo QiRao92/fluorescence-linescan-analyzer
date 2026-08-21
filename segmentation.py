@@ -133,13 +133,17 @@ def measure_cells(
     result: SegmentationResult,
     channels: list[tuple[str, np.ndarray]],
     pixel_size_um: float,
+    ring_um: float = 1.5,
 ) -> tuple[list[str], list[list[float]]]:
-    """Per-cell morphology and per-channel intensity statistics.
+    """Per-cell morphology, intensity, and nuclear/cytoplasm statistics.
 
     channels: (column name, full-image intensity array) pairs.
+    ring_um: width of the cytoplasmic ring grown outward from each
+        segmented object (usually a nucleus); 0 disables ring columns.
     Returns (header, rows) ready for CSV writing.
     """
     from skimage.measure import regionprops
+    from skimage.segmentation import expand_labels
 
     labels = result.labels
     x0, y0 = result.offset
@@ -150,9 +154,21 @@ def measure_cells(
         "centroid_y_um",
         "area_um2",
         "equivalent_diameter_um",
+        "perimeter_um",
+        "circularity",
+        "aspect_ratio",
+        "solidity",
     ]
     rows: list[list[float]] = []
     for prop in regionprops(labels):
+        perimeter_px = float(prop.perimeter)
+        circularity = (
+            min(1.0, 4.0 * np.pi * prop.area / perimeter_px**2)
+            if perimeter_px > 0
+            else float("nan")
+        )
+        minor = float(prop.minor_axis_length)
+        aspect = float(prop.major_axis_length) / minor if minor > 0 else float("nan")
         rows.append(
             [
                 float(prop.label),
@@ -160,17 +176,40 @@ def measure_cells(
                 (y0 + prop.centroid[0]) * pixel_size_um,
                 prop.area * pixel_size_um**2,
                 prop.equivalent_diameter * pixel_size_um,
+                perimeter_px * pixel_size_um,
+                circularity,
+                aspect,
+                float(prop.solidity),
             ]
         )
     index = np.arange(1, labels.max() + 1)
+    ring = None
+    if ring_um > 0 and labels.max() > 0:
+        ring_px = max(1, int(round(ring_um / pixel_size_um)))
+        expanded = expand_labels(labels, distance=ring_px)
+        ring = np.where(labels > 0, 0, expanded)
+        ring_sizes = ndimage.sum(np.ones_like(ring), ring, index)
     for name, data in channels:
         crop = np.asarray(data[y0 : y0 + height, x0 : x0 + width], dtype=np.float32)
         means = ndimage.mean(crop, labels, index)
+        medians = ndimage.median(crop, labels, index)
         maxima = ndimage.maximum(crop, labels, index)
         sums = ndimage.sum(crop, labels, index)
-        header += [f"{name}_mean", f"{name}_max", f"{name}_integrated"]
-        for row, mean, maximum, total in zip(rows, means, maxima, sums):
-            row += [float(mean), float(maximum), float(total)]
+        header += [f"{name}_mean", f"{name}_median", f"{name}_max", f"{name}_integrated"]
+        if ring is not None:
+            header += [f"{name}_cyto_mean", f"{name}_nuc_cyto_ratio"]
+            with np.errstate(invalid="ignore", divide="ignore"):
+                ring_means = np.where(
+                    ring_sizes > 0, ndimage.mean(crop, ring, index), np.nan
+                )
+        for position, (row, mean, median, maximum, total) in enumerate(
+            zip(rows, means, medians, maxima, sums)
+        ):
+            row += [float(mean), float(median), float(maximum), float(total)]
+            if ring is not None:
+                cyto = float(ring_means[position])
+                ratio = float(mean) / cyto if np.isfinite(cyto) and cyto > 0 else float("nan")
+                row += [cyto, ratio]
     return header, rows
 
 
@@ -193,6 +232,7 @@ def export_segmentation(
     source_image: Path,
     output_dir: Path,
     stem: str,
+    ring_um: float = 1.5,
 ) -> dict[str, Path]:
     import tifffile
     from PIL import Image
@@ -203,7 +243,7 @@ def export_segmentation(
     labels_path = output_dir / f"{stem}_labels.tif"
     metadata_path = output_dir / f"{stem}_segmentation.json"
 
-    header, rows = measure_cells(result, channels, pixel_size_um)
+    header, rows = measure_cells(result, channels, pixel_size_um, ring_um=ring_um)
     with csv_path.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.writer(handle)
         writer.writerow(header)
@@ -213,17 +253,42 @@ def export_segmentation(
     Image.fromarray(overlay).save(overlay_path, dpi=(300, 300))
     tifffile.imwrite(labels_path, result.labels.astype(np.uint16 if result.count < 65536 else np.int32))
 
+    region_area_mm2 = (
+        result.labels.shape[0] * result.labels.shape[1] * (pixel_size_um / 1000.0) ** 2
+    )
+    summary: dict[str, object] = {
+        "cell_count": result.count,
+        "cell_density_per_mm2": result.count / region_area_mm2 if region_area_mm2 > 0 else None,
+    }
+    if rows:
+        table = np.asarray(rows, dtype=float)
+        for column_name in ("area_um2", "equivalent_diameter_um", "circularity"):
+            column = table[:, header.index(column_name)]
+            summary[f"mean_{column_name}"] = float(np.nanmean(column))
+        for name, _data in channels:
+            key = f"{name}_mean"
+            if key in header:
+                summary[f"mean_{key}"] = float(np.nanmean(table[:, header.index(key)]))
+            ratio_key = f"{name}_nuc_cyto_ratio"
+            if ratio_key in header:
+                summary[f"mean_{ratio_key}"] = float(np.nanmean(table[:, header.index(ratio_key)]))
     metadata = {
         "source_image": str(source_image),
         "pixel_size_um": pixel_size_um,
         "segmentation_channel": result.source_label,
         "method": result.method,
         "params": result.params,
+        "cyto_ring_um": ring_um,
         "region_offset_xy_px": list(result.offset),
         "region_size_xy_px": [result.labels.shape[1], result.labels.shape[0]],
         "cell_count": result.count,
         "measured_channels": [name for name, _data in channels],
-        "note": "labels.tif is the label mask (0 = background); cell_id in the CSV matches label values.",
+        "summary": summary,
+        "note": (
+            "labels.tif is the label mask (0 = background); cell_id in the CSV matches label values. "
+            "cyto columns sample a ring grown outward from each segmented object (usually a nucleus); "
+            "nuc_cyto_ratio = object mean / ring mean."
+        ),
     }
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     return {

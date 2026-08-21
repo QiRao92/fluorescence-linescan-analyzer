@@ -1887,6 +1887,16 @@ class MainWindow(QMainWindow):
         self.seg_diameter_spin.setToolTip(
             "目标细胞/细胞核的大致直径。高分辨率图像强烈建议填写\n（肝细胞核约 10 µm）；设为 0 让 Cellpose 自动估计。"
         )
+        self.seg_ring_spin = QDoubleSpinBox()
+        self.seg_ring_spin.setRange(0, 20)
+        self.seg_ring_spin.setDecimals(2)
+        self.seg_ring_spin.setSuffix(" µm")
+        self.seg_ring_spin.setSpecialValueText("不测量")
+        self.seg_ring_spin.setValue(1.5)
+        self.seg_ring_spin.setToolTip(
+            "以每个分割对象（通常为细胞核）向外扩展形成胞质环，\n"
+            "导出时计算各通道的胞质强度和核/质强度比；设为 0 关闭。"
+        )
         self.seg_roi_check = QCheckBox("仅分割当前 ROI 区域")
         self.seg_roi_check.setToolTip("大图建议先画 ROI 再分割；不勾选则分割整幅图像")
         form.addRow("分割通道", self.seg_channel_combo)
@@ -1894,6 +1904,7 @@ class MainWindow(QMainWindow):
         form.addRow("最小面积", self.seg_min_area_spin)
         form.addRow("平滑尺度", self.seg_smooth_spin)
         form.addRow("目标直径", self.seg_diameter_spin)
+        form.addRow("胞质环宽", self.seg_ring_spin)
         form.addRow(self.seg_roi_check)
         layout.addWidget(setup)
 
@@ -1919,8 +1930,9 @@ class MainWindow(QMainWindow):
         seg_export_layout.setSpacing(5)
         self.seg_export_button = QPushButton("导出分割结果")
         seg_note = QLabel(
-            "导出：单细胞 CSV（每个通道的 mean/max/integrated 强度、"
-            "面积、质心坐标）、标签掩膜 TIF、边界 Overlay PNG 和参数 JSON。"
+            "导出：单细胞 CSV（面积、周长、圆度、长宽比等形态指标，"
+            "每个通道的 mean/median/max/integrated 强度，以及胞质环强度和"
+            "核/质强度比）、标签掩膜 TIF、边界 Overlay PNG 和含汇总统计的 JSON。"
         )
         seg_note.setObjectName("hint")
         seg_note.setWordWrap(True)
@@ -2076,6 +2088,7 @@ class MainWindow(QMainWindow):
             record.path,
             folder,
             safe_stem(record.path),
+            ring_um=self.seg_ring_spin.value(),
         )
         self.last_export_dir = folder
         self.statusBar().showMessage(
@@ -2883,8 +2896,12 @@ def run_self_test(image_path: Path) -> None:
         if seg_missing:
             raise RuntimeError(f"self-test segmentation export missing: {seg_missing}")
         seg_header = seg_exported["cells_csv"].read_text(encoding="utf-8-sig").splitlines()[0]
-        if "_mean" not in seg_header:
-            raise RuntimeError("self-test segmentation CSV missing intensity columns")
+        for required in ("_mean", "_median", "circularity", "_cyto_mean", "_nuc_cyto_ratio"):
+            if required not in seg_header:
+                raise RuntimeError(f"self-test segmentation CSV missing {required} columns")
+        seg_metadata = json.loads(seg_exported["segmentation_metadata"].read_text(encoding="utf-8"))
+        if "summary" not in seg_metadata or "cell_density_per_mm2" not in seg_metadata["summary"]:
+            raise RuntimeError("self-test segmentation metadata missing summary")
     print(f"Segmentation self-test passed: {record.segmentation.count} cells")
     window.close()
     app.quit()
