@@ -25,7 +25,7 @@ from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 from matplotlib.widgets import RectangleSelector
 from PIL import Image, ImageDraw
-from PySide6.QtCore import QPoint, Qt, QThread, Signal
+from PySide6.QtCore import QPoint, QSettings, Qt, QThread, Signal
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
@@ -50,6 +50,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -943,7 +944,25 @@ def make_curve_figure(record: ImageRecord) -> Figure:
     return figure
 
 
-def export_record(record: ImageRecord, output_dir: Path) -> dict[str, Path]:
+EXPORT_OPTIONS = (
+    ("csv", "曲线 CSV"),
+    ("curve", "曲线图 PNG/PDF"),
+    ("overlay", "全图定位 Overlay"),
+    ("roi_composite", "ROI 合并图（含扫描线版）"),
+    ("roi_channels", "各分析通道 ROI 图"),
+    ("channel_panel", "通道拼版 PNG/PDF"),
+    ("panel", "ROI+曲线组合面板"),
+    ("metadata", "参数 JSON"),
+)
+
+
+def export_record(
+    record: ImageRecord, output_dir: Path, selected: set[str] | None = None
+) -> dict[str, Path]:
+    if selected is None:
+        selected = {key for key, _label in EXPORT_OPTIONS}
+    if not selected:
+        raise ValueError("请至少勾选一项要导出的内容。")
     if not record.analyzed:
         raise ValueError("当前图像还没有完成分析。")
     if not record.loaded:
@@ -967,49 +986,76 @@ def export_record(record: ImageRecord, output_dir: Path) -> dict[str, Path]:
     metadata_path = output_dir / f"{stem}_analysis.json"
 
     assert record.distance_um is not None
-    header = ["distance_um"]
-    columns: list[np.ndarray] = [record.distance_um]
-    for channel in record.analysis_channels:
-        header.append(f"{channel.name}_AU")
-        columns.append(channel.profile)
-        if channel.profile_sd is not None:
-            header.append(f"{channel.name}_SD")
-            columns.append(channel.profile_sd)
-    with csv_path.open("w", newline="", encoding="utf-8-sig") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(header)
-        writer.writerows(zip(*columns))
+    exported: dict[str, Path] = {}
+    if "csv" in selected:
+        header = ["distance_um"]
+        columns: list[np.ndarray] = [record.distance_um]
+        for channel in record.analysis_channels:
+            header.append(f"{channel.name}_AU")
+            columns.append(channel.profile)
+            if channel.profile_sd is not None:
+                header.append(f"{channel.name}_SD")
+                columns.append(channel.profile_sd)
+        with csv_path.open("w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(header)
+            writer.writerows(zip(*columns))
+        exported["csv"] = csv_path
 
-    overlay = make_overlay(record)
-    overlay.save(overlay_path, dpi=(300, 300))
-    roi_images = make_roi_channel_images(record)
-    roi_images["composite"].save(roi_composite_path, dpi=(300, 300))
-    for index, path in enumerate(roi_channel_paths, start=1):
-        roi_images[f"channel_{index}"].save(path, dpi=(300, 300))
-    roi_overlay = add_roi_scan_line(roi_images["composite"], record)
-    roi_overlay.save(roi_overlay_path, dpi=(300, 300))
-    channel_panel = make_channel_panel(record, roi_images)
-    channel_panel.savefig(channel_panel_png, dpi=400, facecolor="white")
-    channel_panel.savefig(channel_panel_pdf, facecolor="white")
-    curve_figure = make_curve_figure(record)
-    curve_figure.savefig(curve_png, dpi=400, facecolor="white")
-    curve_figure.savefig(curve_pdf, facecolor="white")
+    if "overlay" in selected:
+        make_overlay(record).save(overlay_path, dpi=(300, 300))
+        exported["full_overlay"] = overlay_path
 
-    panel = Figure(figsize=(10.5, 4.4), facecolor="white", constrained_layout=True)
-    image_axis = panel.add_subplot(121)
-    curve_axis = panel.add_subplot(122)
-    image_axis.imshow(roi_overlay)
-    image_axis.set_axis_off()
-    image_axis.set_title(f"{record.name} — ROI", fontsize=10)
-    plot_profile_curves(curve_axis, record, lw=1.5)
-    curve_axis.set_xlim(0, max(1.0, float(record.distance_um[-1])))
-    curve_axis.set_ylim(bottom=0)
-    curve_axis.set_xlabel("Distance (µm)")
-    curve_axis.set_ylabel("Fluorescence intensity (A.U.)")
-    curve_axis.spines["top"].set_visible(False)
-    curve_axis.spines["right"].set_visible(False)
-    curve_axis.legend(frameon=False)
-    panel.savefig(panel_png, dpi=400, facecolor="white")
+    roi_images: dict[str, Image.Image] | None = None
+    roi_overlay: Image.Image | None = None
+    if selected & {"roi_composite", "roi_channels", "channel_panel", "panel"}:
+        roi_images = make_roi_channel_images(record)
+        roi_overlay = add_roi_scan_line(roi_images["composite"], record)
+    if "roi_composite" in selected:
+        assert roi_images is not None and roi_overlay is not None
+        roi_images["composite"].save(roi_composite_path, dpi=(300, 300))
+        roi_overlay.save(roi_overlay_path, dpi=(300, 300))
+        exported["roi_composite"] = roi_composite_path
+        exported["roi_overlay"] = roi_overlay_path
+    if "roi_channels" in selected:
+        assert roi_images is not None
+        for index, path in enumerate(roi_channel_paths, start=1):
+            roi_images[f"channel_{index}"].save(path, dpi=(300, 300))
+            exported[f"roi_channel_{index}"] = path
+    if "channel_panel" in selected:
+        assert roi_images is not None
+        channel_panel = make_channel_panel(record, roi_images)
+        channel_panel.savefig(channel_panel_png, dpi=400, facecolor="white")
+        channel_panel.savefig(channel_panel_pdf, facecolor="white")
+        exported["channel_panel_png"] = channel_panel_png
+        exported["channel_panel_pdf"] = channel_panel_pdf
+    if "curve" in selected:
+        curve_figure = make_curve_figure(record)
+        curve_figure.savefig(curve_png, dpi=400, facecolor="white")
+        curve_figure.savefig(curve_pdf, facecolor="white")
+        exported["curve_png"] = curve_png
+        exported["curve_pdf"] = curve_pdf
+
+    if "panel" not in selected:
+        panel = None
+    else:
+        assert roi_overlay is not None
+        panel = Figure(figsize=(10.5, 4.4), facecolor="white", constrained_layout=True)
+        image_axis = panel.add_subplot(121)
+        curve_axis = panel.add_subplot(122)
+        image_axis.imshow(roi_overlay)
+        image_axis.set_axis_off()
+        image_axis.set_title(f"{record.name} — ROI", fontsize=10)
+        plot_profile_curves(curve_axis, record, lw=1.5)
+        curve_axis.set_xlim(0, max(1.0, float(record.distance_um[-1])))
+        curve_axis.set_ylim(bottom=0)
+        curve_axis.set_xlabel("Distance (µm)")
+        curve_axis.set_ylabel("Fluorescence intensity (A.U.)")
+        curve_axis.spines["top"].set_visible(False)
+        curve_axis.spines["right"].set_visible(False)
+        curve_axis.legend(frameon=False)
+        panel.savefig(panel_png, dpi=400, facecolor="white")
+        exported["panel"] = panel_png
 
     metadata = {
         "source_image": str(record.path),
@@ -1052,22 +1098,11 @@ def export_record(record: ImageRecord, output_dir: Path) -> dict[str, Path]:
         "displayed_source_channels": sorted(record.display_source_keys),
         "note": "Exported pseudocolored TIFF intensities are descriptive A.U.; use raw CZI for rigorous between-sample quantification.",
     }
-    metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
-    exported = {
-        "csv": csv_path,
-        "full_overlay": overlay_path,
-        "roi_composite": roi_composite_path,
-        "roi_overlay": roi_overlay_path,
-        "channel_panel_png": channel_panel_png,
-        "channel_panel_pdf": channel_panel_pdf,
-        "curve_png": curve_png,
-        "curve_pdf": curve_pdf,
-        "panel": panel_png,
-        "metadata": metadata_path,
-    }
-    exported.update(
-        {f"roi_channel_{index}": path for index, path in enumerate(roi_channel_paths, start=1)}
-    )
+    if "metadata" in selected:
+        metadata_path.write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        exported["metadata"] = metadata_path
     return exported
 
 
@@ -1603,7 +1638,22 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._build_menu()
         self._apply_style()
+        self._load_export_settings()
         self._update_controls()
+
+    def _load_export_settings(self) -> None:
+        settings = QSettings("FluorescenceLinescanAnalyzer", "export")
+        for key, checkbox in self.export_option_checks.items():
+            checkbox.setChecked(settings.value(f"line/{key}", True, type=bool))
+        for key, checkbox in self.seg_export_option_checks.items():
+            checkbox.setChecked(settings.value(f"segmentation/{key}", True, type=bool))
+
+    def _save_export_settings(self) -> None:
+        settings = QSettings("FluorescenceLinescanAnalyzer", "export")
+        for key, checkbox in self.export_option_checks.items():
+            settings.setValue(f"line/{key}", checkbox.isChecked())
+        for key, checkbox in self.seg_export_option_checks.items():
+            settings.setValue(f"segmentation/{key}", checkbox.isChecked())
 
     @property
     def current_record(self) -> ImageRecord | None:
@@ -1797,6 +1847,19 @@ class MainWindow(QMainWindow):
 
         export_group = QGroupBox("导出")
         export_layout = QVBoxLayout(export_group)
+        export_content_label = QLabel("勾选需要导出的内容：")
+        export_content_label.setObjectName("hint")
+        export_layout.addWidget(export_content_label)
+        export_grid = QGridLayout()
+        export_grid.setHorizontalSpacing(8)
+        export_grid.setVerticalSpacing(2)
+        self.export_option_checks: dict[str, QCheckBox] = {}
+        for position, (key, label) in enumerate(EXPORT_OPTIONS):
+            checkbox = QCheckBox(label)
+            checkbox.setChecked(True)
+            self.export_option_checks[key] = checkbox
+            export_grid.addWidget(checkbox, position // 2, position % 2)
+        export_layout.addLayout(export_grid)
         export_row = QHBoxLayout()
         self.export_current_button = QPushButton("导出当前")
         self.export_all_button = QPushButton("批量导出全部")
@@ -1805,12 +1868,6 @@ class MainWindow(QMainWindow):
         export_layout.addLayout(export_row)
         self.open_output_button = QPushButton("打开最近的导出文件夹")
         export_layout.addWidget(self.open_output_button)
-        self.export_note = QLabel(
-            "导出：全图定位、ROI 合并图、每个分析通道、动态通道面板、曲线、CSV 和参数 JSON"
-        )
-        self.export_note.setObjectName("hint")
-        self.export_note.setWordWrap(True)
-        export_layout.addWidget(self.export_note)
         right_layout.addWidget(export_group)
         right_layout.addStretch(1)
 
@@ -1928,11 +1985,19 @@ class MainWindow(QMainWindow):
         seg_export_layout = QVBoxLayout(seg_export_group)
         seg_export_layout.setContentsMargins(8, 8, 8, 7)
         seg_export_layout.setSpacing(5)
+        seg_content_label = QLabel("勾选需要导出的内容：")
+        seg_content_label.setObjectName("hint")
+        seg_export_layout.addWidget(seg_content_label)
+        self.seg_export_option_checks: dict[str, QCheckBox] = {}
+        for key, label in segmentation.SEGMENTATION_EXPORT_OPTIONS:
+            checkbox = QCheckBox(label)
+            checkbox.setChecked(True)
+            self.seg_export_option_checks[key] = checkbox
+            seg_export_layout.addWidget(checkbox)
         self.seg_export_button = QPushButton("导出分割结果")
         seg_note = QLabel(
-            "导出：单细胞 CSV（面积、周长、圆度、长宽比等形态指标，"
-            "每个通道的 mean/median/max/integrated 强度，以及胞质环强度和"
-            "核/质强度比）、标签掩膜 TIF、边界 Overlay PNG 和含汇总统计的 JSON。"
+            "单细胞 CSV 含形态指标、各通道 mean/median/max/integrated 强度、"
+            "胞质环强度和核/质强度比；JSON 含细胞计数、密度等汇总统计。"
         )
         seg_note.setObjectName("hint")
         seg_note.setWordWrap(True)
@@ -2065,6 +2130,9 @@ class MainWindow(QMainWindow):
         if record is None or record.segmentation is None:
             QMessageBox.warning(self, "无法导出", "请先运行细胞分割。")
             return
+        if not self._selected_seg_exports():
+            QMessageBox.information(self, "未选择内容", "请先勾选至少一项要导出的内容。")
+            return
         folder = self._choose_export_dir()
         if folder is None:
             return
@@ -2089,6 +2157,7 @@ class MainWindow(QMainWindow):
             folder,
             safe_stem(record.path),
             ring_um=self.seg_ring_spin.value(),
+            selected=self._selected_seg_exports(),
         )
         self.last_export_dir = folder
         self.statusBar().showMessage(
@@ -2664,27 +2733,46 @@ class MainWindow(QMainWindow):
         if record is None or not record.analyzed:
             QMessageBox.information(self, "尚未分析", "请先生成当前图像的曲线。")
             return
+        if not self._selected_line_exports():
+            QMessageBox.information(self, "未选择内容", "请先勾选至少一项要导出的内容。")
+            return
         output_dir = self._choose_export_dir()
         if output_dir is None:
             return
         try:
-            paths = export_record(record, output_dir)
+            paths = export_record(record, output_dir, self._selected_line_exports())
             self.last_export_dir = output_dir
             self._update_controls()
             self.statusBar().showMessage(f"已导出到：{output_dir}")
             QMessageBox.information(
                 self,
                 "导出完成",
-                f"已生成 {len(paths)} 个文件，包括 ROI 裁剪图、各通道图、"
-                f"通道组合图、曲线和数据。\n\n{output_dir}",
+                f"已按勾选生成 {len(paths)} 个文件。\n\n{output_dir}",
             )
         except Exception as error:
             QMessageBox.critical(self, "导出失败", str(error))
+
+    def _selected_line_exports(self) -> set[str]:
+        return {
+            key
+            for key, checkbox in self.export_option_checks.items()
+            if checkbox.isChecked()
+        }
+
+    def _selected_seg_exports(self) -> set[str]:
+        return {
+            key
+            for key, checkbox in self.seg_export_option_checks.items()
+            if checkbox.isChecked()
+        }
 
     def export_all(self) -> None:
         analyzed = [record for record in self.records if record.analyzed]
         if not analyzed:
             QMessageBox.information(self, "没有可导出的结果", "请至少完成一张图像的分析。")
+            return
+        if not self._selected_line_exports():
+            QMessageBox.information(self, "未选择内容", "请先勾选至少一项要导出的内容。")
             return
         output_dir = self._choose_export_dir()
         if output_dir is None:
@@ -2699,7 +2787,7 @@ class MainWindow(QMainWindow):
             QApplication.processEvents()
             try:
                 load_record_images(record)
-                export_record(record, output_dir)
+                export_record(record, output_dir, self._selected_line_exports())
             except Exception as error:
                 errors.append(f"{record.name}: {error}")
             finally:
@@ -2761,6 +2849,7 @@ class MainWindow(QMainWindow):
         event.acceptProposedAction()
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self._save_export_settings()
         event.accept()
 
 
@@ -2869,6 +2958,13 @@ def run_self_test(image_path: Path) -> None:
                         f"self-test {key} size {roi_image.size} != ROI {expected_size}"
                     )
         print(f"Self-test passed: {len(exported)} output files")
+    with tempfile.TemporaryDirectory(prefix="linescan_subset_test_") as folder:
+        subset = export_record(record, Path(folder), {"csv", "metadata"})
+        if set(subset.keys()) != {"csv", "metadata"}:
+            raise RuntimeError(f"self-test subset export produced {sorted(subset)}")
+        written = list(Path(folder).iterdir())
+        if len(written) != 2:
+            raise RuntimeError("self-test subset export wrote unselected files")
     if window.seg_channel_combo.count() != len(record.source_channels):
         raise RuntimeError("self-test segmentation channel combo not populated")
     window.seg_channel_combo.setCurrentIndex(window.seg_channel_combo.count() - 1)

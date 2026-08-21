@@ -23,6 +23,13 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 _CELLPOSE_MODEL = None
 
+SEGMENTATION_EXPORT_OPTIONS = (
+    ("cells_csv", "单细胞 CSV"),
+    ("labels", "标签掩膜 TIF"),
+    ("segmentation_overlay", "边界 Overlay PNG"),
+    ("segmentation_metadata", "参数/汇总 JSON"),
+)
+
 
 @dataclass
 class SegmentationResult:
@@ -233,25 +240,40 @@ def export_segmentation(
     output_dir: Path,
     stem: str,
     ring_um: float = 1.5,
+    selected: set[str] | None = None,
 ) -> dict[str, Path]:
     import tifffile
     from PIL import Image
 
+    if selected is None:
+        selected = {key for key, _label in SEGMENTATION_EXPORT_OPTIONS}
+    if not selected:
+        raise ValueError("请至少勾选一项要导出的内容。")
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / f"{stem}_cells.csv"
     overlay_path = output_dir / f"{stem}_segmentation_overlay.png"
     labels_path = output_dir / f"{stem}_labels.tif"
     metadata_path = output_dir / f"{stem}_segmentation.json"
 
+    exported: dict[str, Path] = {}
     header, rows = measure_cells(result, channels, pixel_size_um, ring_um=ring_um)
-    with csv_path.open("w", newline="", encoding="utf-8-sig") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(header)
-        writer.writerows(rows)
+    if "cells_csv" in selected:
+        with csv_path.open("w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(header)
+            writer.writerows(rows)
+        exported["cells_csv"] = csv_path
 
-    overlay = make_segmentation_overlay(composite_rgb, result)
-    Image.fromarray(overlay).save(overlay_path, dpi=(300, 300))
-    tifffile.imwrite(labels_path, result.labels.astype(np.uint16 if result.count < 65536 else np.int32))
+    if "segmentation_overlay" in selected:
+        overlay = make_segmentation_overlay(composite_rgb, result)
+        Image.fromarray(overlay).save(overlay_path, dpi=(300, 300))
+        exported["segmentation_overlay"] = overlay_path
+    if "labels" in selected:
+        tifffile.imwrite(
+            labels_path,
+            result.labels.astype(np.uint16 if result.count < 65536 else np.int32),
+        )
+        exported["labels"] = labels_path
 
     region_area_mm2 = (
         result.labels.shape[0] * result.labels.shape[1] * (pixel_size_um / 1000.0) ** 2
@@ -290,10 +312,9 @@ def export_segmentation(
             "nuc_cyto_ratio = object mean / ring mean."
         ),
     }
-    metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
-    return {
-        "cells_csv": csv_path,
-        "segmentation_overlay": overlay_path,
-        "labels": labels_path,
-        "segmentation_metadata": metadata_path,
-    }
+    if "segmentation_metadata" in selected:
+        metadata_path.write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        exported["segmentation_metadata"] = metadata_path
+    return exported

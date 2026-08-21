@@ -61,7 +61,7 @@ python fluorescence_linescan_analyzer.py image1.tif image2.tif
 
 ## Exported files
 
-Each analyzed image can produce:
+Both export panels offer per-file checkboxes: only selected outputs are generated, and the selection persists across sessions. Each analyzed image can produce:
 
 - `*_profile.csv`: distance and all selected signal intensity profiles, plus `*_SD` columns when the SD option is enabled.
 - `*_overlay.png`: full-image ROI and line location.
