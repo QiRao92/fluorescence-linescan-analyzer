@@ -7,6 +7,7 @@ A desktop GUI for drawing and editing microscopy ROIs, extracting fluorescence l
 ## Features
 
 - Import individual images or recursively load a folder.
+- Open ZEISS CZI files directly: channel names, display colors, and pixel calibration load from the embedded metadata, and profiles use the raw (e.g. 16-bit) intensities.
 - Automatically detect RGB, grayscale, multi-channel, and ZEISS-exported sibling TIFF channels.
 - Add analysis channels manually, select their image source, and enter every signal name yourself.
 - Choose a custom pseudocolor for each channel; the preview, curves, and exported channel images stay synchronized.

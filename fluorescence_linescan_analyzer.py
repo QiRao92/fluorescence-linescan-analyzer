@@ -76,7 +76,7 @@ from skimage.measure import profile_line
 APP_TITLE = "Fluorescence Line-scan Analyzer"
 ROI_COLOR = "#FFD400"
 LINE_COLOR = "#FFFFFF"
-SUPPORTED_SUFFIXES = {".tif", ".tiff", ".png", ".bmp", ".jpg", ".jpeg"}
+SUPPORTED_SUFFIXES = {".czi", ".tif", ".tiff", ".png", ".bmp", ".jpg", ".jpeg"}
 CHANNEL_COLORS = (
     "#D55E00",
     "#0072B2",
@@ -314,6 +314,58 @@ def sibling_channel_paths(composite: Path) -> list[Path]:
     return [path for _index, path in sorted(matches)]
 
 
+def read_czi_channels(
+    path: Path,
+) -> tuple[list[np.ndarray], list[str], list[str | None], float | None]:
+    try:
+        import czifile
+    except ImportError as error:
+        raise ValueError(
+            "读取 CZI 需要 czifile 库：python -m pip install czifile"
+        ) from error
+    with czifile.CziFile(path) as czi:
+        data = czi.asxarray()
+        metadata_text = czi.metadata()
+    names = (
+        [str(value) for value in data.coords["C"].values] if "C" in data.coords else []
+    )
+    for dim in [d for d in data.dims if d not in ("C", "Y", "X")]:
+        data = data.isel({dim: 0})
+    if "C" in data.dims:
+        arrays = [
+            np.asarray(data.isel(C=index).values, dtype=np.float32)
+            for index in range(data.sizes["C"])
+        ]
+    else:
+        arrays = [np.asarray(data.values, dtype=np.float32)]
+    colors: list[str | None] = [None] * len(arrays)
+    pixel_um: float | None = None
+    try:
+        root = ET.fromstring(metadata_text)
+        display_colors: dict[str, str] = {}
+        for channel in root.findall(".//DisplaySetting/Channels/Channel"):
+            name = channel.attrib.get("Name")
+            value = channel.findtext("Color") or ""
+            if name and value.startswith("#"):
+                digits = value.lstrip("#")
+                if len(digits) == 8:
+                    digits = digits[2:]
+                if len(digits) == 6:
+                    display_colors[name] = f"#{digits.upper()}"
+        colors = [display_colors.get(name) for name in names] + [None] * (
+            len(arrays) - len(names)
+        )
+        for distance in root.findall(".//Scaling/Items/Distance"):
+            if distance.attrib.get("Id") == "X":
+                value = distance.findtext("Value")
+                if value:
+                    pixel_um = float(value) * 1e6
+                break
+    except ET.ParseError:
+        pass
+    return arrays, names, colors, pixel_um
+
+
 def parse_pixel_size(path: Path, image_width: int) -> tuple[float, str]:
     for metadata_path in sorted(path.parent.glob("*.tif_metadata.xml")):
         try:
@@ -511,10 +563,42 @@ def _array_channels(array: np.ndarray) -> list[np.ndarray]:
 
 def load_record_images(record: ImageRecord) -> None:
     previous_display_keys = set(record.display_source_keys)
+    source_channels: list[SourceChannel] = []
+    if record.path.suffix.lower() == ".czi":
+        arrays, names, colors, pixel_um = read_czi_channels(record.path)
+        count = len(arrays)
+        height, width = arrays[0].shape
+        for index, values in enumerate(arrays):
+            name = names[index] if index < len(names) else ""
+            source_channels.append(
+                SourceChannel(
+                    key=f"c{index + 1}",
+                    label=f"c{index + 1}（{name}）" if name else f"c{index + 1}",
+                    color=(
+                        colors[index]
+                        if index < len(colors) and colors[index]
+                        else _source_color(index, count)
+                    ),
+                    data=values,
+                    source_path=record.path,
+                )
+            )
+        record.source_channels = source_channels
+        record.rgb = np.zeros((height, width, 3), dtype=np.uint8)
+        record.rgb = composite_from_channels(
+            record, {channel.key for channel in source_channels}
+        )
+        if record.pixel_source == "尚未读取":
+            if pixel_um:
+                record.pixel_size_um = pixel_um
+                record.pixel_source = "读自 CZI 元数据"
+            else:
+                record.pixel_size_um, record.pixel_source = 1.0, "未找到标定；请手动输入"
+        _finish_record_channels(record, previous_display_keys)
+        return
     composite_array = read_image_array(record.path)
     record.rgb = as_rgb(composite_array)
     height, width = record.rgb.shape[:2]
-    source_channels: list[SourceChannel] = []
     channel_files = sibling_channel_paths(record.path)
     if channel_files:
         count = len(channel_files)
@@ -556,15 +640,19 @@ def load_record_images(record: ImageRecord) -> None:
                 )
             )
     record.source_channels = source_channels
-    valid_keys = {channel.key for channel in source_channels}
+    _finish_record_channels(record, previous_display_keys)
+    if record.pixel_source == "尚未读取":
+        record.pixel_size_um, record.pixel_source = parse_pixel_size(record.path, width)
+
+
+def _finish_record_channels(record: ImageRecord, previous_display_keys: set[str]) -> None:
+    valid_keys = {channel.key for channel in record.source_channels}
     record.display_source_keys = (
         previous_display_keys & valid_keys if previous_display_keys & valid_keys else valid_keys
     )
     record.analysis_channels = [
         channel for channel in record.analysis_channels if channel.source_key in valid_keys
     ]
-    if record.pixel_source == "尚未读取":
-        record.pixel_size_um, record.pixel_source = parse_pixel_size(record.path, width)
 
 
 def hex_to_rgb(color: str) -> tuple[int, int, int]:
@@ -1806,7 +1894,7 @@ class MainWindow(QMainWindow):
             self,
             "选择显微镜图像",
             str(Path.cwd()),
-            "图像文件 (*.tif *.tiff *.png *.bmp *.jpg *.jpeg);;所有文件 (*)",
+            "图像文件 (*.czi *.tif *.tiff *.png *.bmp *.jpg *.jpeg);;所有文件 (*)",
         )
         if files:
             self.add_paths([Path(path) for path in files])
