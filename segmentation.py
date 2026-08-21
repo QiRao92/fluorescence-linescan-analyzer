@@ -141,12 +141,15 @@ def measure_cells(
     channels: list[tuple[str, np.ndarray]],
     pixel_size_um: float,
     ring_um: float = 1.5,
+    ratio_names: set[str] | None = None,
 ) -> tuple[list[str], list[list[float]]]:
     """Per-cell morphology, intensity, and nuclear/cytoplasm statistics.
 
     channels: (column name, full-image intensity array) pairs.
     ring_um: width of the cytoplasmic ring grown outward from each
         segmented object (usually a nucleus); 0 disables ring columns.
+    ratio_names: channel names that get cyto/nuc-cyto-ratio columns;
+        None means every channel, an empty set means none.
     Returns (header, rows) ready for CSV writing.
     """
     from skimage.measure import regionprops
@@ -190,8 +193,13 @@ def measure_cells(
             ]
         )
     index = np.arange(1, labels.max() + 1)
+    wants_ratio = lambda name: ratio_names is None or name in ratio_names  # noqa: E731
     ring = None
-    if ring_um > 0 and labels.max() > 0:
+    if (
+        ring_um > 0
+        and labels.max() > 0
+        and any(wants_ratio(name) for name, _data in channels)
+    ):
         ring_px = max(1, int(round(ring_um / pixel_size_um)))
         expanded = expand_labels(labels, distance=ring_px)
         ring = np.where(labels > 0, 0, expanded)
@@ -203,17 +211,18 @@ def measure_cells(
         maxima = ndimage.maximum(crop, labels, index)
         sums = ndimage.sum(crop, labels, index)
         header += [f"{name}_mean", f"{name}_median", f"{name}_max", f"{name}_integrated"]
-        if ring is not None:
+        channel_ring = ring if wants_ratio(name) else None
+        if channel_ring is not None:
             header += [f"{name}_cyto_mean", f"{name}_nuc_cyto_ratio"]
             with np.errstate(invalid="ignore", divide="ignore"):
                 ring_means = np.where(
-                    ring_sizes > 0, ndimage.mean(crop, ring, index), np.nan
+                    ring_sizes > 0, ndimage.mean(crop, channel_ring, index), np.nan
                 )
         for position, (row, mean, median, maximum, total) in enumerate(
             zip(rows, means, medians, maxima, sums)
         ):
             row += [float(mean), float(median), float(maximum), float(total)]
-            if ring is not None:
+            if channel_ring is not None:
                 cyto = float(ring_means[position])
                 ratio = float(mean) / cyto if np.isfinite(cyto) and cyto > 0 else float("nan")
                 row += [cyto, ratio]
@@ -241,6 +250,7 @@ def export_segmentation(
     stem: str,
     ring_um: float = 1.5,
     selected: set[str] | None = None,
+    ratio_names: set[str] | None = None,
 ) -> dict[str, Path]:
     import tifffile
     from PIL import Image
@@ -256,7 +266,9 @@ def export_segmentation(
     metadata_path = output_dir / f"{stem}_segmentation.json"
 
     exported: dict[str, Path] = {}
-    header, rows = measure_cells(result, channels, pixel_size_um, ring_um=ring_um)
+    header, rows = measure_cells(
+        result, channels, pixel_size_um, ring_um=ring_um, ratio_names=ratio_names
+    )
     if "cells_csv" in selected:
         with csv_path.open("w", newline="", encoding="utf-8-sig") as handle:
             writer = csv.writer(handle)

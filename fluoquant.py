@@ -2068,8 +2068,14 @@ class MainWindow(QMainWindow):
         self.seg_ring_spin.setValue(1.5)
         self.seg_ring_spin.setToolTip(
             "以每个分割对象（通常为细胞核）向外扩展形成胞质环，\n"
-            "导出时计算各通道的胞质强度和核/质强度比；设为 0 关闭。"
+            "对下方勾选的通道计算胞质强度和核/质强度比；设为 0 关闭。"
         )
+        self.seg_ratio_widget = QWidget()
+        self.seg_ratio_layout = QVBoxLayout(self.seg_ratio_widget)
+        self.seg_ratio_layout.setContentsMargins(0, 0, 0, 0)
+        self.seg_ratio_layout.setSpacing(2)
+        self.seg_ratio_checks: dict[str, QCheckBox] = {}
+        self._seg_ratio_selected: set[str] = set()
         self.seg_roi_check = QCheckBox("仅分割当前 ROI 区域")
         self.seg_roi_check.setToolTip("大图建议先画 ROI 再分割；不勾选则分割整幅图像")
         form.addRow("分割通道", self.seg_channel_combo)
@@ -2078,6 +2084,7 @@ class MainWindow(QMainWindow):
         form.addRow("平滑尺度", self.seg_smooth_spin)
         form.addRow("目标直径", self.seg_diameter_spin)
         form.addRow("胞质环宽", self.seg_ring_spin)
+        form.addRow("核/质比通道", self.seg_ratio_widget)
         form.addRow(self.seg_roi_check)
         layout.addWidget(setup)
 
@@ -2168,6 +2175,37 @@ class MainWindow(QMainWindow):
                         break
             combo.setCurrentIndex(target if target >= 0 else 0)
         combo.blockSignals(False)
+        self._refresh_seg_ratio_checks()
+
+    def _refresh_seg_ratio_checks(self) -> None:
+        record = self.current_record
+        self._clear_layout(self.seg_ratio_layout)
+        self.seg_ratio_checks.clear()
+        if record is None or not record.loaded:
+            placeholder = QLabel("导入图片后选择")
+            placeholder.setObjectName("hint")
+            self.seg_ratio_layout.addWidget(placeholder)
+            return
+        for name, _data in self._measured_channels(record):
+            checkbox = QCheckBox(name)
+            checkbox.setChecked(name in self._seg_ratio_selected)
+            checkbox.toggled.connect(self._seg_ratio_toggled)
+            self.seg_ratio_checks[name] = checkbox
+            self.seg_ratio_layout.addWidget(checkbox)
+
+    def _seg_ratio_toggled(self, _checked: bool = False) -> None:
+        for name, checkbox in self.seg_ratio_checks.items():
+            if checkbox.isChecked():
+                self._seg_ratio_selected.add(name)
+            else:
+                self._seg_ratio_selected.discard(name)
+
+    def _selected_ratio_names(self) -> set[str]:
+        return {
+            name
+            for name, checkbox in self.seg_ratio_checks.items()
+            if checkbox.isChecked()
+        }
 
     def run_segmentation(self, checked: bool = False) -> None:
         del checked
@@ -2193,6 +2231,7 @@ class MainWindow(QMainWindow):
         diameter = self.seg_diameter_spin.value()
         ring_um = self.seg_ring_spin.value()
         channels = self._measured_channels(record)
+        ratio_names = self._selected_ratio_names()
         params = {"min_area_um2": min_area}
         if method == "classical":
             params["smooth_um"] = smooth
@@ -2217,7 +2256,7 @@ class MainWindow(QMainWindow):
                 params=params,
             )
             header, rows = segmentation.measure_cells(
-                result, channels, pixel, ring_um=ring_um
+                result, channels, pixel, ring_um=ring_um, ratio_names=ratio_names
             )
             return result, header, rows
 
@@ -2339,6 +2378,7 @@ class MainWindow(QMainWindow):
             safe_stem(record.path),
             ring_um=self.seg_ring_spin.value(),
             selected=seg_selected,
+            ratio_names=self._selected_ratio_names(),
         )
         self.last_export_dir = folder
         self.statusBar().showMessage(
@@ -2630,6 +2670,7 @@ class MainWindow(QMainWindow):
     def rebuild_analysis_channel_rows(self) -> None:
         self._clear_layout(self.analysis_rows_layout)
         self.analysis_row_widgets.clear()
+        self._refresh_seg_ratio_checks()
         record = self.current_record
         if record is None or not record.loaded:
             empty = QLabel("请先导入并选择图像。")
@@ -3161,6 +3202,12 @@ def run_self_test(image_path: Path) -> None:
         raise RuntimeError("self-test segmentation summary table missing")
     if "细胞数" not in window.seg_summary_label.text():
         raise RuntimeError("self-test segmentation summary display not updated")
+    if any(
+        name.endswith("_nuc_cyto_ratio") for name in record.segmentation_table[0]
+    ):
+        raise RuntimeError("self-test ratio columns present although none selected")
+    if len(window.seg_ratio_checks) != len(record.source_channels):
+        raise RuntimeError("self-test ratio channel checkboxes not populated")
     with tempfile.TemporaryDirectory(prefix="linescan_seg_test_") as folder:
         seg_exported = segmentation.export_segmentation(
             record.segmentation,
