@@ -520,6 +520,7 @@ class ImageRecord:
     analysis_background_percentile: float | None = None
     analysis_compute_sd: bool = False
     segmentation: "segmentation.SegmentationResult | None" = None
+    segmentation_table: tuple[list[str], list[list[float]]] | None = None
     dirty: bool = True
 
     @property
@@ -1609,6 +1610,59 @@ class CurveCanvas(FigureCanvasQTAgg):
         self.draw_idle()
 
 
+class SegSummaryCanvas(FigureCanvasQTAgg):
+    def __init__(self) -> None:
+        self.figure = Figure(figsize=(4.6, 2.1), facecolor="white")
+        super().__init__(self.figure)
+        self.setMinimumHeight(185)
+        self.clear_plot()
+
+    def clear_plot(self) -> None:
+        self.figure.clear()
+        axis = self.figure.add_subplot(111)
+        axis.text(
+            0.5,
+            0.5,
+            "运行分割后显示分布直方图",
+            transform=axis.transAxes,
+            ha="center",
+            va="center",
+            color="#6B7280",
+        )
+        axis.set_axis_off()
+        self.draw_idle()
+
+    def show_table(self, header: list[str], rows: list[list[float]]) -> None:
+        if not rows:
+            self.clear_plot()
+            return
+        table = np.asarray(rows, dtype=float)
+        self.figure.clear()
+        panels: list[tuple[str, np.ndarray]] = [
+            ("面积 (µm²)", table[:, header.index("area_um2")])
+        ]
+        ratio_columns = [name for name in header if name.endswith("_nuc_cyto_ratio")]
+        ratio_columns.sort(
+            key=lambda name: bool(re.match(r"^(c\d|Ch\d|R|G|B|Gray)", name))
+        )
+        if ratio_columns:
+            values = table[:, header.index(ratio_columns[0])]
+            values = values[np.isfinite(values)]
+            if values.size:
+                panels.append((ratio_columns[0].replace("_nuc_cyto_ratio", " 核/质比"), values))
+        for position, (title, values) in enumerate(panels, start=1):
+            axis = self.figure.add_subplot(1, len(panels), position)
+            axis.hist(values, bins=min(24, max(6, len(values) // 3)), color="#0072B2", alpha=0.85)
+            axis.set_title(title, fontsize=8)
+            axis.tick_params(labelsize=7)
+            axis.spines["top"].set_visible(False)
+            axis.spines["right"].set_visible(False)
+        self.figure.subplots_adjust(
+            left=0.13, right=0.97, bottom=0.18, top=0.85, wspace=0.35
+        )
+        self.draw_idle()
+
+
 class ExportOptionsDialog(QDialog):
     def __init__(
         self,
@@ -2043,6 +2097,17 @@ class MainWindow(QMainWindow):
         run_layout.addWidget(self.seg_status)
         layout.addWidget(run_group)
 
+        overview_group = QGroupBox("结果概览")
+        overview_layout = QVBoxLayout(overview_group)
+        overview_layout.setContentsMargins(8, 8, 8, 7)
+        overview_layout.setSpacing(5)
+        self.seg_summary_label = QLabel("尚无分割结果。")
+        self.seg_summary_label.setWordWrap(True)
+        self.seg_summary_canvas = SegSummaryCanvas()
+        overview_layout.addWidget(self.seg_summary_label)
+        overview_layout.addWidget(self.seg_summary_canvas)
+        layout.addWidget(overview_group)
+
         seg_export_group = QGroupBox("导出")
         seg_export_layout = QVBoxLayout(seg_export_group)
         seg_export_layout.setContentsMargins(8, 8, 8, 7)
@@ -2126,13 +2191,15 @@ class MainWindow(QMainWindow):
         min_area = self.seg_min_area_spin.value()
         smooth = self.seg_smooth_spin.value()
         diameter = self.seg_diameter_spin.value()
+        ring_um = self.seg_ring_spin.value()
+        channels = self._measured_channels(record)
         params = {"min_area_um2": min_area}
         if method == "classical":
             params["smooth_um"] = smooth
         else:
             params["diameter_um"] = diameter or "auto"
 
-        def task() -> segmentation.SegmentationResult:
+        def task() -> tuple:
             if method == "classical":
                 labels = segmentation.segment_classical(
                     data, pixel, min_area_um2=min_area, smooth_um=smooth
@@ -2141,7 +2208,7 @@ class MainWindow(QMainWindow):
                 labels = segmentation.segment_cellpose(
                     data, pixel, diameter_um=diameter, min_area_um2=min_area
                 )
-            return segmentation.SegmentationResult(
+            result = segmentation.SegmentationResult(
                 labels=labels,
                 offset=offset,
                 source_key=source.key,
@@ -2149,6 +2216,10 @@ class MainWindow(QMainWindow):
                 method=method,
                 params=params,
             )
+            header, rows = segmentation.measure_cells(
+                result, channels, pixel, ring_um=ring_um
+            )
+            return result, header, rows
 
         self.seg_run_button.setEnabled(False)
         self.seg_status.setText(
@@ -2161,17 +2232,81 @@ class MainWindow(QMainWindow):
         self._seg_worker.failed.connect(self._segmentation_failed)
         self._seg_worker.start()
 
-    def _segmentation_done(self, result: object) -> None:
+    def _segmentation_done(self, payload: object) -> None:
         self.seg_run_button.setEnabled(True)
         record = getattr(self, "_seg_record", None)
-        if record is None or not isinstance(result, segmentation.SegmentationResult):
+        if (
+            record is None
+            or not isinstance(payload, tuple)
+            or not isinstance(payload[0], segmentation.SegmentationResult)
+        ):
             return
+        result, header, rows = payload
         record.segmentation = result
+        record.segmentation_table = (header, rows)
         message = f"检测到 {result.count} 个细胞（{'Cellpose' if result.method == 'cellpose' else '经典方法'}，通道 {result.source_label}）。"
         self.seg_status.setText(message + " 可切换通道显示核对边界，然后导出。")
         self.statusBar().showMessage(message)
         if record is self.current_record:
             self.image_canvas.render()
+            self._update_seg_summary_display()
+
+    def _update_seg_summary_display(self) -> None:
+        record = self.current_record
+        if (
+            record is None
+            or record.segmentation is None
+            or record.segmentation_table is None
+        ):
+            self.seg_summary_label.setText("尚无分割结果。")
+            self.seg_summary_canvas.clear_plot()
+            return
+        seg = record.segmentation
+        header, rows = record.segmentation_table
+        region_mm2 = (
+            seg.labels.shape[0] * seg.labels.shape[1] * (record.pixel_size_um / 1000.0) ** 2
+        )
+        method_name = "Cellpose" if seg.method == "cellpose" else "经典方法"
+        lines = [
+            f"细胞数 {seg.count}｜密度 {seg.count / region_mm2:.0f} 个/mm²（{method_name}，{seg.source_label}）"
+        ]
+        if rows:
+            table = np.asarray(rows, dtype=float)
+            areas = table[:, header.index("area_um2")]
+            lines.append(
+                f"面积 {np.nanmean(areas):.1f} ± {np.nanstd(areas):.1f} µm²"
+                f"（{np.nanmin(areas):.1f}–{np.nanmax(areas):.1f}）"
+            )
+            channel_names = [
+                name[: -len("_mean")]
+                for name in header
+                if name.endswith("_mean") and not name.endswith("_cyto_mean")
+            ]
+            for name in channel_names:
+                text = f"{name}：均值 {np.nanmean(table[:, header.index(f'{name}_mean')]):.0f}"
+                ratio_key = f"{name}_nuc_cyto_ratio"
+                if ratio_key in header:
+                    ratios = table[:, header.index(ratio_key)]
+                    ratios = ratios[np.isfinite(ratios)]
+                    if ratios.size:
+                        text += f"｜核/质比 {np.mean(ratios):.2f}"
+                lines.append(text)
+        self.seg_summary_label.setText("\n".join(lines))
+        self.seg_summary_canvas.show_table(header, rows)
+
+    def _measured_channels(self, record: ImageRecord) -> list[tuple[str, np.ndarray]]:
+        channels: list[tuple[str, np.ndarray]] = []
+        for source in record.source_channels:
+            name = next(
+                (
+                    channel.name.strip()
+                    for channel in record.analysis_channels
+                    if channel.source_key == source.key and channel.name.strip()
+                ),
+                None,
+            )
+            channels.append((name or source.label, source.data))
+        return channels
 
     def _segmentation_failed(self, message: str) -> None:
         self.seg_run_button.setEnabled(True)
@@ -2192,17 +2327,7 @@ class MainWindow(QMainWindow):
         folder = self._choose_export_dir()
         if folder is None:
             return
-        channels: list[tuple[str, np.ndarray]] = []
-        for source in record.source_channels:
-            name = next(
-                (
-                    channel.name.strip()
-                    for channel in record.analysis_channels
-                    if channel.source_key == source.key and channel.name.strip()
-                ),
-                None,
-            )
-            channels.append((name or source.label, source.data))
+        channels = self._measured_channels(record)
         assert record.rgb is not None
         exported = segmentation.export_segmentation(
             record.segmentation,
@@ -2734,6 +2859,7 @@ class MainWindow(QMainWindow):
         self._refresh_list_item(row)
         self.sync_roi_inputs()
         self.curve_canvas.show_record(self.current_record)
+        self._update_seg_summary_display()
         self._update_controls()
 
     def clear_roi(self) -> None:
@@ -3031,6 +3157,10 @@ def run_self_test(image_path: Path) -> None:
         raise RuntimeError("self-test segmentation produced no result")
     if record.segmentation.count < 1:
         raise RuntimeError("self-test segmentation found no cells in the ROI")
+    if record.segmentation_table is None or not record.segmentation_table[1]:
+        raise RuntimeError("self-test segmentation summary table missing")
+    if "细胞数" not in window.seg_summary_label.text():
+        raise RuntimeError("self-test segmentation summary display not updated")
     with tempfile.TemporaryDirectory(prefix="linescan_seg_test_") as folder:
         seg_exported = segmentation.export_segmentation(
             record.segmentation,
