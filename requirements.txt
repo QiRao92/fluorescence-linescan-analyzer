@@ -8,3 +8,5 @@ Pillow>=10.0
 PySide6>=6.6
 scipy>=1.11
 scikit-image>=0.22
+# 可选：细胞分割的深度学习方法（经典方法无需以下依赖）
+# cellpose>=4.0

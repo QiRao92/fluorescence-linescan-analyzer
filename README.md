@@ -19,6 +19,7 @@ A desktop GUI for drawing and editing microscopy ROIs, extracting fluorescence l
 - Optionally compute per-point SD across the sampling strip: curves gain a shaded mean ± SD band and the CSV gains `*_SD` columns.
 - Preview all selected intensity profiles directly in the application.
 - Export full-image QC overlays, cropped ROI images, one image per selected analysis channel, a dynamic channel panel, profile CSV, curves, and JSON metadata.
+- Cell segmentation module (separate tab): classical Otsu + watershed (no extra dependencies) or Cellpose (optional, GPU-accelerated), whole image or ROI only, with boundary overlay preview and per-cell CSV / label-mask / overlay export.
 
 ## Channel workflow
 

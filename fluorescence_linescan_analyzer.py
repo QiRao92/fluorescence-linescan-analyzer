@@ -25,7 +25,7 @@ from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 from matplotlib.widgets import RectangleSelector
 from PIL import Image, ImageDraw
-from PySide6.QtCore import QPoint, Qt, Signal
+from PySide6.QtCore import QPoint, Qt, QThread, Signal
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
@@ -66,11 +66,14 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStatusBar,
     QStyle,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
-from scipy.ndimage import gaussian_filter1d
+from scipy.ndimage import gaussian_filter1d, maximum_filter
 from skimage.measure import profile_line
+
+import segmentation
 
 
 APP_TITLE = "Fluorescence Line-scan Analyzer"
@@ -515,6 +518,7 @@ class ImageRecord:
     analysis_smoothing_sigma: float | None = None
     analysis_background_percentile: float | None = None
     analysis_compute_sd: bool = False
+    segmentation: "segmentation.SegmentationResult | None" = None
     dirty: bool = True
 
     @property
@@ -1090,6 +1094,8 @@ class ImageCanvas(FigureCanvasQTAgg):
         self._display_cache: tuple | None = None
         self._crop_box: tuple[int, int, int, int] | None = None
         self._crop_step: int = 1
+        self.show_segmentation = True
+        self._seg_mask_cache: tuple | None = None
         self.mpl_connect("key_press_event", self._on_key)
         self.mpl_connect("scroll_event", self._on_scroll)
         self.mpl_connect("button_press_event", self._on_pan_press)
@@ -1170,6 +1176,18 @@ class ImageCanvas(FigureCanvasQTAgg):
             extent=(cx0 - 0.5, cx1 - 0.5, cy1 - 0.5, cy0 - 0.5),
             interpolation="nearest" if step == 1 else "auto",
         )
+        if self.record.segmentation is not None and self.show_segmentation:
+            boundary_crop = self._segmentation_mask((height, width))[cy0:cy1, cx0:cx1]
+            if step > 1:
+                boundary_crop = maximum_filter(boundary_crop, size=step)
+            boundary_small = boundary_crop[::step, ::step]
+            overlay = np.zeros(boundary_small.shape + (4,), dtype=np.uint8)
+            overlay[boundary_small] = (255, 214, 0, 255)
+            self.axis.imshow(
+                overlay,
+                extent=(cx0 - 0.5, cx1 - 0.5, cy1 - 0.5, cy0 - 0.5),
+                interpolation="nearest",
+            )
         self.axis.set_axis_off()
         self.axis.set_title(self.record.name, color="white", fontsize=11, pad=8)
         if self.record.roi is not None and self.mode != "roi":
@@ -1209,6 +1227,15 @@ class ImageCanvas(FigureCanvasQTAgg):
             self.axis.set_xlim(self.view[0])
             self.axis.set_ylim(self.view[1])
         self.draw_idle()
+
+    def _segmentation_mask(self, shape: tuple[int, int]) -> np.ndarray:
+        assert self.record is not None and self.record.segmentation is not None
+        signature = (id(self.record), id(self.record.segmentation))
+        if self._seg_mask_cache is not None and self._seg_mask_cache[0] == signature:
+            return self._seg_mask_cache[1]
+        mask = self.record.segmentation.full_boundary_mask(shape)
+        self._seg_mask_cache = (signature, mask)
+        return mask
 
     def _full_extent(self) -> tuple[tuple[float, float], tuple[float, float]] | None:
         if self.record is None or self.record.rgb is None:
@@ -1547,6 +1574,21 @@ class CurveCanvas(FigureCanvasQTAgg):
         self.draw_idle()
 
 
+class FunctionWorker(QThread):
+    done = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, fn, parent=None) -> None:
+        super().__init__(parent)
+        self._fn = fn
+
+    def run(self) -> None:
+        try:
+            self.done.emit(self._fn())
+        except Exception as error:
+            self.failed.emit(str(error))
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -1771,7 +1813,13 @@ class MainWindow(QMainWindow):
         export_layout.addWidget(self.export_note)
         right_layout.addWidget(export_group)
         right_layout.addStretch(1)
-        self.main_splitter.addWidget(self.right_scroll)
+
+        self.right_tabs = QTabWidget()
+        self.right_tabs.setMinimumWidth(340)
+        self.right_tabs.setMaximumWidth(560)
+        self.right_tabs.addTab(self.right_scroll, "线扫描")
+        self.right_tabs.addTab(self._build_segmentation_tab(), "细胞分割")
+        self.main_splitter.addWidget(self.right_tabs)
         self.main_splitter.setSizes([260, 850, 420])
         self.main_splitter.setStretchFactor(0, 0)
         self.main_splitter.setStretchFactor(1, 1)
@@ -1802,6 +1850,237 @@ class MainWindow(QMainWindow):
         self.image_canvas.selection_changed.connect(self.selection_changed)
         self.image_canvas.message.connect(self.statusBar().showMessage)
         self.image_canvas.mode_changed.connect(self.canvas_mode_changed)
+
+    def _build_segmentation_tab(self) -> QScrollArea:
+        panel = QFrame()
+        panel.setObjectName("sidePanel")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        setup = QGroupBox("分割设置")
+        form = QFormLayout(setup)
+        form.setContentsMargins(8, 8, 8, 7)
+        form.setHorizontalSpacing(8)
+        form.setVerticalSpacing(5)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.seg_channel_combo = QComboBox()
+        self.seg_channel_combo.setToolTip("选择用于分割的通道，通常是核染色（DAPI/Hoechst）")
+        self.seg_method_combo = QComboBox()
+        self.seg_method_combo.addItems(["经典（Otsu + 分水岭）", "Cellpose（深度学习）"])
+        self.seg_min_area_spin = QDoubleSpinBox()
+        self.seg_min_area_spin.setRange(1, 100000)
+        self.seg_min_area_spin.setDecimals(1)
+        self.seg_min_area_spin.setSuffix(" µm²")
+        self.seg_min_area_spin.setValue(20.0)
+        self.seg_smooth_spin = QDoubleSpinBox()
+        self.seg_smooth_spin.setRange(0, 10)
+        self.seg_smooth_spin.setDecimals(2)
+        self.seg_smooth_spin.setSuffix(" µm")
+        self.seg_smooth_spin.setValue(0.5)
+        self.seg_diameter_spin = QDoubleSpinBox()
+        self.seg_diameter_spin.setRange(0, 1000)
+        self.seg_diameter_spin.setDecimals(1)
+        self.seg_diameter_spin.setSuffix(" µm")
+        self.seg_diameter_spin.setSpecialValueText("自动")
+        self.seg_diameter_spin.setValue(10.0)
+        self.seg_diameter_spin.setToolTip(
+            "目标细胞/细胞核的大致直径。高分辨率图像强烈建议填写\n（肝细胞核约 10 µm）；设为 0 让 Cellpose 自动估计。"
+        )
+        self.seg_roi_check = QCheckBox("仅分割当前 ROI 区域")
+        self.seg_roi_check.setToolTip("大图建议先画 ROI 再分割；不勾选则分割整幅图像")
+        form.addRow("分割通道", self.seg_channel_combo)
+        form.addRow("方法", self.seg_method_combo)
+        form.addRow("最小面积", self.seg_min_area_spin)
+        form.addRow("平滑尺度", self.seg_smooth_spin)
+        form.addRow("目标直径", self.seg_diameter_spin)
+        form.addRow(self.seg_roi_check)
+        layout.addWidget(setup)
+
+        run_group = QGroupBox("运行")
+        run_layout = QVBoxLayout(run_group)
+        run_layout.setContentsMargins(8, 8, 8, 7)
+        run_layout.setSpacing(5)
+        self.seg_run_button = QPushButton("运行细胞分割")
+        self.seg_run_button.setObjectName("primaryButton")
+        self.seg_show_check = QCheckBox("在图像上显示分割边界")
+        self.seg_show_check.setChecked(True)
+        self.seg_status = QLabel("尚未运行分割。")
+        self.seg_status.setObjectName("hint")
+        self.seg_status.setWordWrap(True)
+        run_layout.addWidget(self.seg_run_button)
+        run_layout.addWidget(self.seg_show_check)
+        run_layout.addWidget(self.seg_status)
+        layout.addWidget(run_group)
+
+        seg_export_group = QGroupBox("导出")
+        seg_export_layout = QVBoxLayout(seg_export_group)
+        seg_export_layout.setContentsMargins(8, 8, 8, 7)
+        seg_export_layout.setSpacing(5)
+        self.seg_export_button = QPushButton("导出分割结果")
+        seg_note = QLabel(
+            "导出：单细胞 CSV（每个通道的 mean/max/integrated 强度、"
+            "面积、质心坐标）、标签掩膜 TIF、边界 Overlay PNG 和参数 JSON。"
+        )
+        seg_note.setObjectName("hint")
+        seg_note.setWordWrap(True)
+        seg_export_layout.addWidget(self.seg_export_button)
+        seg_export_layout.addWidget(seg_note)
+        layout.addWidget(seg_export_group)
+        layout.addStretch(1)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setWidget(panel)
+
+        self.seg_run_button.clicked.connect(self.run_segmentation)
+        self.seg_export_button.clicked.connect(self.export_segmentation_results)
+        self.seg_show_check.toggled.connect(self._toggle_segmentation_display)
+        self.seg_method_combo.currentIndexChanged.connect(self._seg_method_changed)
+        self._seg_method_changed(0)
+        return scroll
+
+    def _seg_method_changed(self, index: int) -> None:
+        classical = index == 0
+        self.seg_smooth_spin.setEnabled(classical)
+        self.seg_diameter_spin.setEnabled(not classical)
+
+    def _toggle_segmentation_display(self, checked: bool) -> None:
+        self.image_canvas.show_segmentation = checked
+        self.image_canvas.render()
+
+    def _refresh_seg_channel_combo(self) -> None:
+        record = self.current_record
+        combo = self.seg_channel_combo
+        previous = combo.currentData()
+        combo.blockSignals(True)
+        combo.clear()
+        if record is not None and record.loaded:
+            for source in record.source_channels:
+                combo.addItem(source.label, source.key)
+            target = combo.findData(previous) if previous is not None else -1
+            if target < 0:
+                for row in range(combo.count()):
+                    if any(
+                        marker in combo.itemText(row).upper()
+                        for marker in ("DAPI", "HOECHST")
+                    ):
+                        target = row
+                        break
+            combo.setCurrentIndex(target if target >= 0 else 0)
+        combo.blockSignals(False)
+
+    def run_segmentation(self, checked: bool = False) -> None:
+        del checked
+        record = self.current_record
+        if record is None or not record.loaded:
+            QMessageBox.warning(self, "无法分割", "请先导入并选择一张图像。")
+            return
+        source = record.source_channel(self.seg_channel_combo.currentData())
+        if source is None:
+            QMessageBox.warning(self, "无法分割", "请选择有效的分割通道。")
+            return
+        method = "cellpose" if self.seg_method_combo.currentIndex() == 1 else "classical"
+        if self.seg_roi_check.isChecked() and record.roi is not None:
+            x, y, width, height = record.roi
+            data = np.array(source.data[y : y + height, x : x + width])
+            offset = (x, y)
+        else:
+            data = source.data
+            offset = (0, 0)
+        pixel = record.pixel_size_um
+        min_area = self.seg_min_area_spin.value()
+        smooth = self.seg_smooth_spin.value()
+        diameter = self.seg_diameter_spin.value()
+        params = {"min_area_um2": min_area}
+        if method == "classical":
+            params["smooth_um"] = smooth
+        else:
+            params["diameter_um"] = diameter or "auto"
+
+        def task() -> segmentation.SegmentationResult:
+            if method == "classical":
+                labels = segmentation.segment_classical(
+                    data, pixel, min_area_um2=min_area, smooth_um=smooth
+                )
+            else:
+                labels = segmentation.segment_cellpose(
+                    data, pixel, diameter_um=diameter, min_area_um2=min_area
+                )
+            return segmentation.SegmentationResult(
+                labels=labels,
+                offset=offset,
+                source_key=source.key,
+                source_label=source.label,
+                method=method,
+                params=params,
+            )
+
+        self.seg_run_button.setEnabled(False)
+        self.seg_status.setText(
+            "分割计算中…" + ("（Cellpose 首次运行需要加载模型）" if method == "cellpose" else "")
+        )
+        self.statusBar().showMessage("细胞分割计算中…")
+        self._seg_record = record
+        self._seg_worker = FunctionWorker(task, self)
+        self._seg_worker.done.connect(self._segmentation_done)
+        self._seg_worker.failed.connect(self._segmentation_failed)
+        self._seg_worker.start()
+
+    def _segmentation_done(self, result: object) -> None:
+        self.seg_run_button.setEnabled(True)
+        record = getattr(self, "_seg_record", None)
+        if record is None or not isinstance(result, segmentation.SegmentationResult):
+            return
+        record.segmentation = result
+        message = f"检测到 {result.count} 个细胞（{'Cellpose' if result.method == 'cellpose' else '经典方法'}，通道 {result.source_label}）。"
+        self.seg_status.setText(message + " 可切换通道显示核对边界，然后导出。")
+        self.statusBar().showMessage(message)
+        if record is self.current_record:
+            self.image_canvas.render()
+
+    def _segmentation_failed(self, message: str) -> None:
+        self.seg_run_button.setEnabled(True)
+        self.seg_status.setText(f"分割失败：{message}")
+        QMessageBox.warning(self, "分割失败", message)
+
+    def export_segmentation_results(self, checked: bool = False) -> None:
+        del checked
+        record = self.current_record
+        if record is None or record.segmentation is None:
+            QMessageBox.warning(self, "无法导出", "请先运行细胞分割。")
+            return
+        folder = self._choose_export_dir()
+        if folder is None:
+            return
+        channels: list[tuple[str, np.ndarray]] = []
+        for source in record.source_channels:
+            name = next(
+                (
+                    channel.name.strip()
+                    for channel in record.analysis_channels
+                    if channel.source_key == source.key and channel.name.strip()
+                ),
+                None,
+            )
+            channels.append((name or source.label, source.data))
+        assert record.rgb is not None
+        exported = segmentation.export_segmentation(
+            record.segmentation,
+            record.rgb,
+            channels,
+            record.pixel_size_um,
+            record.path,
+            folder,
+            safe_stem(record.path),
+        )
+        self.last_export_dir = folder
+        self.statusBar().showMessage(
+            f"分割结果已导出 {len(exported)} 个文件到 {folder}"
+        )
 
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("文件")
@@ -2064,6 +2343,7 @@ class MainWindow(QMainWindow):
                 self.display_channel_checks[source.key] = checkbox
                 self.display_channel_layout.addWidget(checkbox)
         self.display_channel_layout.addStretch(1)
+        self._refresh_seg_channel_combo()
 
     def update_channels(self) -> None:
         record = self.current_record
@@ -2440,6 +2720,9 @@ class MainWindow(QMainWindow):
             "6. 导出全图定位、ROI 裁剪、每个分析通道、曲线图和 CSV。\n\n"
             "视图缩放：滚轮以鼠标位置为中心放大/缩小；空闲状态下左键拖动平移，"
             "双击复位；ROI/扫描线模式下可用中键拖动平移。\n\n"
+            "细胞分割：右侧“细胞分割”标签页。选择核染色通道，用经典方法"
+            "（无需额外依赖）或 Cellpose（需安装，支持 GPU），可只分割 ROI 区域；"
+            "结果导出单细胞 CSV、标签掩膜和 Overlay。\n\n"
             "提示：当前 ZEISS 导出的 8-bit 伪彩色通道适合展示性线扫描；"
             "严格的样本间强度比较应使用原始 CZI/16-bit 数据。",
         )
@@ -2573,6 +2856,36 @@ def run_self_test(image_path: Path) -> None:
                         f"self-test {key} size {roi_image.size} != ROI {expected_size}"
                     )
         print(f"Self-test passed: {len(exported)} output files")
+    if window.seg_channel_combo.count() != len(record.source_channels):
+        raise RuntimeError("self-test segmentation channel combo not populated")
+    window.seg_channel_combo.setCurrentIndex(window.seg_channel_combo.count() - 1)
+    window.seg_roi_check.setChecked(True)
+    window.seg_method_combo.setCurrentIndex(0)
+    window.run_segmentation()
+    if not window._seg_worker.wait(180000):
+        raise RuntimeError("self-test segmentation timed out")
+    QApplication.processEvents()
+    if record.segmentation is None:
+        raise RuntimeError("self-test segmentation produced no result")
+    if record.segmentation.count < 1:
+        raise RuntimeError("self-test segmentation found no cells in the ROI")
+    with tempfile.TemporaryDirectory(prefix="linescan_seg_test_") as folder:
+        seg_exported = segmentation.export_segmentation(
+            record.segmentation,
+            record.rgb,
+            [(channel.label, channel.data) for channel in record.source_channels],
+            record.pixel_size_um,
+            record.path,
+            Path(folder),
+            safe_stem(record.path),
+        )
+        seg_missing = [path for path in seg_exported.values() if not path.exists()]
+        if seg_missing:
+            raise RuntimeError(f"self-test segmentation export missing: {seg_missing}")
+        seg_header = seg_exported["cells_csv"].read_text(encoding="utf-8-sig").splitlines()[0]
+        if "_mean" not in seg_header:
+            raise RuntimeError("self-test segmentation CSV missing intensity columns")
+    print(f"Segmentation self-test passed: {record.segmentation.count} cells")
     window.close()
     app.quit()
 
