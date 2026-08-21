@@ -1,6 +1,6 @@
-# Fluorescence Line-scan Analyzer
+# FluoQuant
 
-双击 `open_Fluorescence_Linescan_Analyzer.bat` 打开完整分析界面。
+双击 `open_FluoQuant.bat` 打开完整分析界面。
 
 ## 基本流程
 

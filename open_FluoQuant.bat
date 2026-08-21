@@ -6,9 +6,9 @@ cd /d "%SCRIPT_DIR%"
 where pythonw.exe >nul 2>nul
 if errorlevel 1 (
     echo Could not find pythonw.exe. Starting with python.exe instead.
-    python "%SCRIPT_DIR%fluorescence_linescan_analyzer.py"
+    python "%SCRIPT_DIR%fluoquant.py"
     if errorlevel 1 pause
 ) else (
-    start "" pythonw.exe "%SCRIPT_DIR%fluorescence_linescan_analyzer.py"
+    start "" pythonw.exe "%SCRIPT_DIR%fluoquant.py"
 )
 endlocal

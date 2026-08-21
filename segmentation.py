@@ -1,4 +1,4 @@
-"""Cell segmentation module for the Fluorescence Line-scan Analyzer.
+"""Cell segmentation module for FluoQuant.
 
 Pure computation: no GUI imports. Provides a classical
 (Otsu + watershed) pipeline with no extra dependencies and an optional

@@ -5,7 +5,7 @@
 !README.md
 !README_GUI_中文.md
 !requirements.txt
-!fluorescence_linescan_analyzer.py
+!fluoquant.py
 !segmentation.py
-!open_Fluorescence_Linescan_Analyzer.bat
+!open_FluoQuant.bat
 !gui_interface_preview_v2.png

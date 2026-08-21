@@ -1,6 +1,6 @@
-# Fluorescence Line-scan Analyzer
+# FluoQuant
 
-A desktop GUI for drawing and editing microscopy ROIs, extracting fluorescence line profiles from a user-defined number of channels, and exporting publication-ready ROI/channel panels.
+A desktop GUI for quantitative fluorescence microscopy: draw and edit ROIs, extract line-scan intensity profiles from any number of channels, segment cells (classical or Cellpose), and export publication-ready panels and per-cell statistics. Formerly known as "Fluorescence Line-scan Analyzer".
 
 ![Application interface](gui_interface_preview_v2.png)
 
@@ -37,16 +37,16 @@ python -m pip install -r requirements.txt
 
 ## Run
 
-On Windows, double-click `open_Fluorescence_Linescan_Analyzer.bat`, or run:
+On Windows, double-click `open_FluoQuant.bat`, or run:
 
 ```powershell
-python fluorescence_linescan_analyzer.py
+python fluoquant.py
 ```
 
 Images can also be passed on the command line:
 
 ```powershell
-python fluorescence_linescan_analyzer.py image1.tif image2.tif
+python fluoquant.py image1.tif image2.tif
 ```
 
 ## Workflow

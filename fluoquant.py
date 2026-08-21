@@ -77,7 +77,7 @@ from skimage.measure import profile_line
 import segmentation
 
 
-APP_TITLE = "Fluorescence Line-scan Analyzer"
+APP_TITLE = "FluoQuant"
 ROI_COLOR = "#FFD400"
 LINE_COLOR = "#FFFFFF"
 SUPPORTED_SUFFIXES = {".czi", ".tif", ".tiff", ".png", ".bmp", ".jpg", ".jpeg"}
@@ -1609,6 +1609,60 @@ class CurveCanvas(FigureCanvasQTAgg):
         self.draw_idle()
 
 
+class ExportOptionsDialog(QDialog):
+    def __init__(
+        self,
+        options: tuple[tuple[str, str], ...],
+        selected: set[str],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("选择导出内容")
+        self.setModal(True)
+        self.setMinimumWidth(380)
+        layout = QVBoxLayout(self)
+        hint = QLabel("勾选本次要导出的文件（选择会被记住）：")
+        layout.addWidget(hint)
+        self._checks: dict[str, QCheckBox] = {}
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(4)
+        for position, (key, label) in enumerate(options):
+            checkbox = QCheckBox(label)
+            checkbox.setChecked(key in selected)
+            self._checks[key] = checkbox
+            grid.addWidget(checkbox, position // 2, position % 2)
+        layout.addLayout(grid)
+        quick_row = QHBoxLayout()
+        select_all = QPushButton("全选")
+        select_none = QPushButton("全不选")
+        select_all.clicked.connect(lambda: self._set_all(True))
+        select_none.clicked.connect(lambda: self._set_all(False))
+        quick_row.addWidget(select_all)
+        quick_row.addWidget(select_none)
+        quick_row.addStretch(1)
+        layout.addLayout(quick_row)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._accept_if_any)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _set_all(self, checked: bool) -> None:
+        for checkbox in self._checks.values():
+            checkbox.setChecked(checked)
+
+    def selected(self) -> set[str]:
+        return {key for key, checkbox in self._checks.items() if checkbox.isChecked()}
+
+    def _accept_if_any(self) -> None:
+        if not self.selected():
+            QMessageBox.information(self, "未选择内容", "请至少勾选一项要导出的内容。")
+            return
+        self.accept()
+
+
 class FunctionWorker(QThread):
     done = Signal(object)
     failed = Signal(str)
@@ -1642,18 +1696,35 @@ class MainWindow(QMainWindow):
         self._update_controls()
 
     def _load_export_settings(self) -> None:
-        settings = QSettings("FluorescenceLinescanAnalyzer", "export")
-        for key, checkbox in self.export_option_checks.items():
-            checkbox.setChecked(settings.value(f"line/{key}", True, type=bool))
-        for key, checkbox in self.seg_export_option_checks.items():
-            checkbox.setChecked(settings.value(f"segmentation/{key}", True, type=bool))
+        settings = QSettings("FluoQuant", "export")
+        self.line_export_selection = {
+            key
+            for key, _label in EXPORT_OPTIONS
+            if settings.value(f"line/{key}", True, type=bool)
+        }
+        self.seg_export_selection = {
+            key
+            for key, _label in segmentation.SEGMENTATION_EXPORT_OPTIONS
+            if settings.value(f"segmentation/{key}", True, type=bool)
+        }
 
     def _save_export_settings(self) -> None:
-        settings = QSettings("FluorescenceLinescanAnalyzer", "export")
-        for key, checkbox in self.export_option_checks.items():
-            settings.setValue(f"line/{key}", checkbox.isChecked())
-        for key, checkbox in self.seg_export_option_checks.items():
-            settings.setValue(f"segmentation/{key}", checkbox.isChecked())
+        settings = QSettings("FluoQuant", "export")
+        for key, _label in EXPORT_OPTIONS:
+            settings.setValue(f"line/{key}", key in self.line_export_selection)
+        for key, _label in segmentation.SEGMENTATION_EXPORT_OPTIONS:
+            settings.setValue(f"segmentation/{key}", key in self.seg_export_selection)
+
+    def _ask_export_selection(
+        self, options: tuple[tuple[str, str], ...], attribute: str
+    ) -> set[str] | None:
+        dialog = ExportOptionsDialog(options, getattr(self, attribute), self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        selected = dialog.selected()
+        setattr(self, attribute, selected)
+        self._save_export_settings()
+        return selected
 
     @property
     def current_record(self) -> ImageRecord | None:
@@ -1676,9 +1747,9 @@ class MainWindow(QMainWindow):
         left_panel.setMinimumWidth(220)
         left_panel.setMaximumWidth(330)
         left_layout = QVBoxLayout(left_panel)
-        title = QLabel("荧光线扫描")
+        title = QLabel("FluoQuant")
         title.setObjectName("appTitle")
-        subtitle = QLabel("导入 → 选区 → 画线 → 分析 → 导出")
+        subtitle = QLabel("荧光线扫描 · 细胞分割 · 定量导出")
         subtitle.setObjectName("subtitle")
         left_layout.addWidget(title)
         left_layout.addWidget(subtitle)
@@ -1847,19 +1918,10 @@ class MainWindow(QMainWindow):
 
         export_group = QGroupBox("导出")
         export_layout = QVBoxLayout(export_group)
-        export_content_label = QLabel("勾选需要导出的内容：")
-        export_content_label.setObjectName("hint")
-        export_layout.addWidget(export_content_label)
-        export_grid = QGridLayout()
-        export_grid.setHorizontalSpacing(8)
-        export_grid.setVerticalSpacing(2)
-        self.export_option_checks: dict[str, QCheckBox] = {}
-        for position, (key, label) in enumerate(EXPORT_OPTIONS):
-            checkbox = QCheckBox(label)
-            checkbox.setChecked(True)
-            self.export_option_checks[key] = checkbox
-            export_grid.addWidget(checkbox, position // 2, position % 2)
-        export_layout.addLayout(export_grid)
+        export_note = QLabel("点击导出后，会先弹窗选择要生成的文件。")
+        export_note.setObjectName("hint")
+        export_note.setWordWrap(True)
+        export_layout.addWidget(export_note)
         export_row = QHBoxLayout()
         self.export_current_button = QPushButton("导出当前")
         self.export_all_button = QPushButton("批量导出全部")
@@ -1985,19 +2047,11 @@ class MainWindow(QMainWindow):
         seg_export_layout = QVBoxLayout(seg_export_group)
         seg_export_layout.setContentsMargins(8, 8, 8, 7)
         seg_export_layout.setSpacing(5)
-        seg_content_label = QLabel("勾选需要导出的内容：")
-        seg_content_label.setObjectName("hint")
-        seg_export_layout.addWidget(seg_content_label)
-        self.seg_export_option_checks: dict[str, QCheckBox] = {}
-        for key, label in segmentation.SEGMENTATION_EXPORT_OPTIONS:
-            checkbox = QCheckBox(label)
-            checkbox.setChecked(True)
-            self.seg_export_option_checks[key] = checkbox
-            seg_export_layout.addWidget(checkbox)
         self.seg_export_button = QPushButton("导出分割结果")
         seg_note = QLabel(
-            "单细胞 CSV 含形态指标、各通道 mean/median/max/integrated 强度、"
-            "胞质环强度和核/质强度比；JSON 含细胞计数、密度等汇总统计。"
+            "点击导出后弹窗选择要生成的文件。单细胞 CSV 含形态指标、"
+            "各通道 mean/median/max/integrated 强度、胞质环强度和核/质强度比；"
+            "JSON 含细胞计数、密度等汇总统计。"
         )
         seg_note.setObjectName("hint")
         seg_note.setWordWrap(True)
@@ -2130,8 +2184,10 @@ class MainWindow(QMainWindow):
         if record is None or record.segmentation is None:
             QMessageBox.warning(self, "无法导出", "请先运行细胞分割。")
             return
-        if not self._selected_seg_exports():
-            QMessageBox.information(self, "未选择内容", "请先勾选至少一项要导出的内容。")
+        seg_selected = self._ask_export_selection(
+            segmentation.SEGMENTATION_EXPORT_OPTIONS, "seg_export_selection"
+        )
+        if seg_selected is None:
             return
         folder = self._choose_export_dir()
         if folder is None:
@@ -2157,7 +2213,7 @@ class MainWindow(QMainWindow):
             folder,
             safe_stem(record.path),
             ring_um=self.seg_ring_spin.value(),
-            selected=self._selected_seg_exports(),
+            selected=seg_selected,
         )
         self.last_export_dir = folder
         self.statusBar().showMessage(
@@ -2210,7 +2266,16 @@ class MainWindow(QMainWindow):
             QGroupBox { color: #111827; background: #FFFFFF; font-weight: 600; border: 1px solid #D1D5DB; border-radius: 7px; margin-top: 8px; padding-top: 10px; }
             QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
             QCheckBox { color: #111827; background: transparent; spacing: 5px; }
-            QCheckBox::indicator { width: 14px; height: 14px; }
+            QCheckBox::indicator {
+                width: 15px; height: 15px;
+                border: 1px solid #7C8698; border-radius: 3px;
+                background: #FFFFFF;
+            }
+            QCheckBox::indicator:hover { border-color: #0072B2; }
+            QCheckBox::indicator:checked { background: #0072B2; border-color: #005A8E; }
+            QCheckBox::indicator:checked:hover { background: #1E88C7; }
+            QCheckBox::indicator:unchecked:disabled { background: #E5E7EB; border-color: #CBD5E1; }
+            QCheckBox::indicator:checked:disabled { background: #9CA3AF; border-color: #9CA3AF; }
             QPushButton { color: #111827; min-height: 30px; border: 1px solid #CBD5E1; border-radius: 5px; background: #FFFFFF; padding: 3px 8px; }
             QPushButton:hover { color: #111827; background: #F1F5F9; border-color: #94A3B8; }
             QPushButton:pressed { color: #111827; background: #E2E8F0; }
@@ -2733,14 +2798,14 @@ class MainWindow(QMainWindow):
         if record is None or not record.analyzed:
             QMessageBox.information(self, "尚未分析", "请先生成当前图像的曲线。")
             return
-        if not self._selected_line_exports():
-            QMessageBox.information(self, "未选择内容", "请先勾选至少一项要导出的内容。")
+        selected = self._ask_export_selection(EXPORT_OPTIONS, "line_export_selection")
+        if selected is None:
             return
         output_dir = self._choose_export_dir()
         if output_dir is None:
             return
         try:
-            paths = export_record(record, output_dir, self._selected_line_exports())
+            paths = export_record(record, output_dir, selected)
             self.last_export_dir = output_dir
             self._update_controls()
             self.statusBar().showMessage(f"已导出到：{output_dir}")
@@ -2752,27 +2817,15 @@ class MainWindow(QMainWindow):
         except Exception as error:
             QMessageBox.critical(self, "导出失败", str(error))
 
-    def _selected_line_exports(self) -> set[str]:
-        return {
-            key
-            for key, checkbox in self.export_option_checks.items()
-            if checkbox.isChecked()
-        }
-
-    def _selected_seg_exports(self) -> set[str]:
-        return {
-            key
-            for key, checkbox in self.seg_export_option_checks.items()
-            if checkbox.isChecked()
-        }
-
     def export_all(self) -> None:
         analyzed = [record for record in self.records if record.analyzed]
         if not analyzed:
             QMessageBox.information(self, "没有可导出的结果", "请至少完成一张图像的分析。")
             return
-        if not self._selected_line_exports():
-            QMessageBox.information(self, "未选择内容", "请先勾选至少一项要导出的内容。")
+        batch_selected = self._ask_export_selection(
+            EXPORT_OPTIONS, "line_export_selection"
+        )
+        if batch_selected is None:
             return
         output_dir = self._choose_export_dir()
         if output_dir is None:
@@ -2787,7 +2840,7 @@ class MainWindow(QMainWindow):
             QApplication.processEvents()
             try:
                 load_record_images(record)
-                export_record(record, output_dir, self._selected_line_exports())
+                export_record(record, output_dir, batch_selected)
             except Exception as error:
                 errors.append(f"{record.name}: {error}")
             finally:
