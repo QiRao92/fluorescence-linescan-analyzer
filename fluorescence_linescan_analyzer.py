@@ -392,6 +392,7 @@ class SourceChannel:
     color: str
     data: np.ndarray
     source_path: Path | None = None
+    norm: np.ndarray | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -671,10 +672,18 @@ def composite_from_channels(
     for channel in record.source_channels:
         if channel.key not in selected:
             continue
-        intensity = normalize_uint8(channel.data).astype(np.float32) / 255.0
+        if channel.norm is None:
+            channel.norm = normalize_uint8(channel.data)
         color = hex_to_rgb(channel.color)
         for component, value in enumerate(color):
-            contribution = np.round(intensity * value).astype(np.uint8)
+            if value == 0:
+                continue
+            if value == 255:
+                contribution = channel.norm
+            else:
+                contribution = (
+                    (channel.norm.astype(np.uint16) * value) // 255
+                ).astype(np.uint8)
             output[..., component] = np.maximum(output[..., component], contribution)
     return output
 
@@ -1078,6 +1087,9 @@ class ImageCanvas(FigureCanvasQTAgg):
         self.roi_snapshot: tuple | None = None
         self.view: tuple[tuple[float, float], tuple[float, float]] | None = None
         self._pan_start: tuple | None = None
+        self._display_cache: tuple | None = None
+        self._crop_box: tuple[int, int, int, int] | None = None
+        self._crop_step: int = 1
         self.mpl_connect("key_press_event", self._on_key)
         self.mpl_connect("scroll_event", self._on_scroll)
         self.mpl_connect("button_press_event", self._on_pan_press)
@@ -1089,9 +1101,28 @@ class ImageCanvas(FigureCanvasQTAgg):
         self.cancel_mode()
         if record is not self.record:
             self.view = None
+            self._display_cache = None
         self.record = record
         self.visible_source_keys = set(record.display_source_keys) if record else None
         self.render()
+
+    def _cached_composite(self) -> np.ndarray:
+        assert self.record is not None
+        keys = (
+            self.visible_source_keys
+            if self.visible_source_keys is not None
+            else self.record.display_source_keys
+        )
+        signature = (
+            id(self.record),
+            frozenset(keys),
+            tuple((channel.key, channel.color) for channel in self.record.source_channels),
+        )
+        if self._display_cache is not None and self._display_cache[0] == signature:
+            return self._display_cache[1]
+        composite = composite_from_channels(self.record, set(keys))
+        self._display_cache = (signature, composite)
+        return composite
 
     def set_visible_sources(self, source_keys: set[str]) -> None:
         if self.mode == "roi":
@@ -1119,8 +1150,26 @@ class ImageCanvas(FigureCanvasQTAgg):
             self.axis.set_axis_off()
             self.draw_idle()
             return
-        display = composite_from_channels(self.record, self.visible_source_keys)
-        self.axis.imshow(display)
+        display = self._cached_composite()
+        height, width = display.shape[:2]
+        if self.view is not None:
+            (vx0, vx1), (vy0, vy1) = self.view
+            span_x, span_y = vx1 - vx0, vy0 - vy1
+            cx0 = max(0, int(vx0 - span_x))
+            cx1 = min(width, int(np.ceil(vx1 + span_x)) + 1)
+            cy0 = max(0, int(vy1 - span_y))
+            cy1 = min(height, int(np.ceil(vy0 + span_y)) + 1)
+        else:
+            cx0, cy0, cx1, cy1 = 0, 0, width, height
+        crop = display[cy0:cy1, cx0:cx1]
+        step = max(1, int(np.ceil(max(crop.shape[0], crop.shape[1]) / 2400)))
+        self._crop_box = (cx0, cy0, cx1, cy1)
+        self._crop_step = step
+        self.axis.imshow(
+            crop[::step, ::step],
+            extent=(cx0 - 0.5, cx1 - 0.5, cy1 - 0.5, cy0 - 0.5),
+            interpolation="nearest" if step == 1 else "auto",
+        )
         self.axis.set_axis_off()
         self.axis.set_title(self.record.name, color="white", fontsize=11, pad=8)
         if self.record.roi is not None and self.mode != "roi":
@@ -1186,17 +1235,32 @@ class ImageCanvas(FigureCanvasQTAgg):
             self.view = ((x0, x0 + span_x), (y1 + span_y, y1))
             self.axis.set_xlim(self.view[0])
             self.axis.set_ylim(self.view[1])
-        self.draw_idle()
+        if self._needs_recrop():
+            self.render()
+        else:
+            self.draw_idle()
+
+    def _needs_recrop(self) -> bool:
+        if self._crop_box is None:
+            return True
+        cx0, cy0, cx1, cy1 = self._crop_box
+        extent = self._full_extent()
+        if extent is None:
+            return False
+        if self.view is None:
+            (_fx0, fx1), (fy0, _fy1) = extent
+            return not (cx0 <= 0 and cy0 <= 0 and cx1 >= fx1 + 0.5 and cy1 >= fy0 + 0.5)
+        (vx0, vx1), (vy0, vy1) = self.view
+        if vx0 < cx0 or vx1 > cx1 or vy1 < cy0 or vy0 > cy1:
+            return True
+        needed = max(1, int(np.ceil(3 * max(vx1 - vx0, vy0 - vy1) / 2400)))
+        return self._crop_step > needed
 
     def reset_view(self) -> None:
         if self.view is None:
             return
         self.view = None
-        extent = self._full_extent()
-        if extent is not None:
-            self.axis.set_xlim(extent[0])
-            self.axis.set_ylim(extent[1])
-            self.draw_idle()
+        self.render()
 
     def _on_scroll(self, event) -> None:
         if (
