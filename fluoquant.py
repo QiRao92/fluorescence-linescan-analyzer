@@ -1213,17 +1213,22 @@ class ImageCanvas(FigureCanvasQTAgg):
             interpolation="nearest" if step == 1 else "auto",
         )
         if self.record.segmentation is not None and self.show_segmentation:
-            boundary_crop = self._segmentation_mask((height, width))[cy0:cy1, cx0:cx1]
-            if step > 1:
-                boundary_crop = maximum_filter(boundary_crop, size=step)
-            boundary_small = boundary_crop[::step, ::step]
-            overlay = np.zeros(boundary_small.shape + (4,), dtype=np.uint8)
-            overlay[boundary_small] = (255, 214, 0, 255)
-            self.axis.imshow(
-                overlay,
-                extent=(cx0 - 0.5, cx1 - 0.5, cy1 - 0.5, cy0 - 0.5),
-                interpolation="nearest",
-            )
+            cell_mask, nucleus_mask = self._segmentation_mask((height, width))
+            layers = [(cell_mask, (255, 214, 0, 255))]
+            if nucleus_mask is not None:
+                layers.append((nucleus_mask, (0, 229, 255, 255)))
+            for mask, rgba in layers:
+                boundary_crop = mask[cy0:cy1, cx0:cx1]
+                if step > 1:
+                    boundary_crop = maximum_filter(boundary_crop, size=step)
+                boundary_small = boundary_crop[::step, ::step]
+                overlay = np.zeros(boundary_small.shape + (4,), dtype=np.uint8)
+                overlay[boundary_small] = rgba
+                self.axis.imshow(
+                    overlay,
+                    extent=(cx0 - 0.5, cx1 - 0.5, cy1 - 0.5, cy0 - 0.5),
+                    interpolation="nearest",
+                )
         self.axis.set_axis_off()
         self.axis.set_title(self.record.name, color="white", fontsize=11, pad=8)
         if self.record.roi is not None and self.mode != "roi":
@@ -1264,14 +1269,19 @@ class ImageCanvas(FigureCanvasQTAgg):
             self.axis.set_ylim(self.view[1])
         self.draw_idle()
 
-    def _segmentation_mask(self, shape: tuple[int, int]) -> np.ndarray:
+    def _segmentation_mask(
+        self, shape: tuple[int, int]
+    ) -> tuple[np.ndarray, np.ndarray | None]:
         assert self.record is not None and self.record.segmentation is not None
         signature = (id(self.record), id(self.record.segmentation))
         if self._seg_mask_cache is not None and self._seg_mask_cache[0] == signature:
             return self._seg_mask_cache[1]
-        mask = self.record.segmentation.full_boundary_mask(shape)
-        self._seg_mask_cache = (signature, mask)
-        return mask
+        masks = (
+            self.record.segmentation.full_boundary_mask(shape),
+            self.record.segmentation.full_nucleus_boundary_mask(shape),
+        )
+        self._seg_mask_cache = (signature, masks)
+        return masks
 
     def _full_extent(self) -> tuple[tuple[float, float], tuple[float, float]] | None:
         if self.record is None or self.record.rgb is None:
@@ -1638,9 +1648,12 @@ class SegSummaryCanvas(FigureCanvasQTAgg):
             return
         table = np.asarray(rows, dtype=float)
         self.figure.clear()
-        panels: list[tuple[str, np.ndarray]] = [
-            ("面积 (µm²)", table[:, header.index("area_um2")])
-        ]
+        if "cell_area_um2" in header:
+            panels: list[tuple[str, np.ndarray]] = [
+                ("细胞面积 (µm²)", table[:, header.index("cell_area_um2")])
+            ]
+        else:
+            panels = [("面积 (µm²)", table[:, header.index("area_um2")])]
         ratio_columns = [name for name in header if name.endswith("_nuc_cyto_ratio")]
         ratio_columns.sort(
             key=lambda name: bool(re.match(r"^(c\d|Ch\d|R|G|B|Gray)", name))
@@ -2037,8 +2050,19 @@ class MainWindow(QMainWindow):
         form.setHorizontalSpacing(8)
         form.setVerticalSpacing(5)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.seg_mode_combo = QComboBox()
+        self.seg_mode_combo.addItems(["单通道（核/对象）", "双通道（核 + 胞体）"])
+        self.seg_mode_combo.setToolTip(
+            "单通道：只分割一个通道里的对象（如 DAPI 核），胞质用向外扩环近似。\n"
+            "双通道：核通道分核 + 胞体通道（如 F-actin）勾勒细胞边界，\n"
+            "得到真实的细胞/核/胞质三个区室和核质面积比。"
+        )
         self.seg_channel_combo = QComboBox()
         self.seg_channel_combo.setToolTip("选择用于分割的通道，通常是核染色（DAPI/Hoechst）")
+        self.seg_cell_combo = QComboBox()
+        self.seg_cell_combo.setToolTip(
+            "勾勒细胞边界/胞质的通道（如 F-actin、膜染色）；仅双通道模式使用"
+        )
         self.seg_method_combo = QComboBox()
         self.seg_method_combo.addItems(["经典（Otsu + 分水岭）", "Cellpose（深度学习）"])
         self.seg_min_area_spin = QDoubleSpinBox()
@@ -2078,7 +2102,9 @@ class MainWindow(QMainWindow):
         self._seg_ratio_selected: set[str] = set()
         self.seg_roi_check = QCheckBox("仅分割当前 ROI 区域")
         self.seg_roi_check.setToolTip("大图建议先画 ROI 再分割；不勾选则分割整幅图像")
-        form.addRow("分割通道", self.seg_channel_combo)
+        form.addRow("分割模式", self.seg_mode_combo)
+        form.addRow("核通道", self.seg_channel_combo)
+        form.addRow("胞体通道", self.seg_cell_combo)
         form.addRow("方法", self.seg_method_combo)
         form.addRow("最小面积", self.seg_min_area_spin)
         form.addRow("平滑尺度", self.seg_smooth_spin)
@@ -2143,21 +2169,34 @@ class MainWindow(QMainWindow):
         self.seg_export_button.clicked.connect(self.export_segmentation_results)
         self.seg_show_check.toggled.connect(self._toggle_segmentation_display)
         self.seg_method_combo.currentIndexChanged.connect(self._seg_method_changed)
+        self.seg_mode_combo.currentIndexChanged.connect(self._seg_method_changed)
         self._seg_method_changed(0)
         return scroll
 
-    def _seg_method_changed(self, index: int) -> None:
-        classical = index == 0
+    def _seg_method_changed(self, _index: int = 0) -> None:
+        classical = self.seg_method_combo.currentIndex() == 0
+        dual = self.seg_mode_combo.currentIndex() == 1
+        self.seg_cell_combo.setEnabled(dual)
         self.seg_smooth_spin.setEnabled(classical)
-        self.seg_diameter_spin.setEnabled(not classical)
+        # 双通道模式下经典方法也用直径限制细胞从核向外的扩展范围
+        self.seg_diameter_spin.setEnabled(dual or not classical)
+        self.seg_ring_spin.setEnabled(not dual)
+        if dual and self.seg_diameter_spin.value() == 10.0:
+            self.seg_diameter_spin.setValue(20.0)
+        elif not dual and self.seg_diameter_spin.value() == 20.0:
+            self.seg_diameter_spin.setValue(10.0)
 
     def _toggle_segmentation_display(self, checked: bool) -> None:
         self.image_canvas.show_segmentation = checked
         self.image_canvas.render()
 
-    def _refresh_seg_channel_combo(self) -> None:
-        record = self.current_record
-        combo = self.seg_channel_combo
+    @staticmethod
+    def _fill_channel_combo(
+        combo: QComboBox,
+        record: ImageRecord | None,
+        preferred_markers: tuple[str, ...],
+        avoid_key: str | None = None,
+    ) -> None:
         previous = combo.currentData()
         combo.blockSignals(True)
         combo.clear()
@@ -2169,12 +2208,29 @@ class MainWindow(QMainWindow):
                 for row in range(combo.count()):
                     if any(
                         marker in combo.itemText(row).upper()
-                        for marker in ("DAPI", "HOECHST")
+                        for marker in preferred_markers
                     ):
+                        target = row
+                        break
+            if target < 0 and avoid_key is not None:
+                for row in range(combo.count()):
+                    if combo.itemData(row) != avoid_key:
                         target = row
                         break
             combo.setCurrentIndex(target if target >= 0 else 0)
         combo.blockSignals(False)
+
+    def _refresh_seg_channel_combo(self) -> None:
+        record = self.current_record
+        self._fill_channel_combo(
+            self.seg_channel_combo, record, ("DAPI", "HOECHST")
+        )
+        self._fill_channel_combo(
+            self.seg_cell_combo,
+            record,
+            ("ACTIN", "PHALLOIDIN", "AF555", "WGA", "MEMBRANE"),
+            avoid_key=self.seg_channel_combo.currentData(),
+        )
         self._refresh_seg_ratio_checks()
 
     def _refresh_seg_ratio_checks(self) -> None:
@@ -2215,15 +2271,32 @@ class MainWindow(QMainWindow):
             return
         source = record.source_channel(self.seg_channel_combo.currentData())
         if source is None:
-            QMessageBox.warning(self, "无法分割", "请选择有效的分割通道。")
+            QMessageBox.warning(self, "无法分割", "请选择有效的核通道。")
             return
+        dual = self.seg_mode_combo.currentIndex() == 1
+        cell_source = (
+            record.source_channel(self.seg_cell_combo.currentData()) if dual else None
+        )
+        if dual:
+            if cell_source is None:
+                QMessageBox.warning(self, "无法分割", "请选择有效的胞体通道。")
+                return
+            if cell_source.key == source.key:
+                QMessageBox.warning(self, "无法分割", "核通道和胞体通道不能相同。")
+                return
         method = "cellpose" if self.seg_method_combo.currentIndex() == 1 else "classical"
         if self.seg_roi_check.isChecked() and record.roi is not None:
             x, y, width, height = record.roi
             data = np.array(source.data[y : y + height, x : x + width])
+            cell_data = (
+                np.array(cell_source.data[y : y + height, x : x + width])
+                if cell_source is not None
+                else None
+            )
             offset = (x, y)
         else:
             data = source.data
+            cell_data = cell_source.data if cell_source is not None else None
             offset = (0, 0)
         pixel = record.pixel_size_um
         min_area = self.seg_min_area_spin.value()
@@ -2235,29 +2308,62 @@ class MainWindow(QMainWindow):
         params = {"min_area_um2": min_area}
         if method == "classical":
             params["smooth_um"] = smooth
-        else:
+        if dual or method == "cellpose":
             params["diameter_um"] = diameter or "auto"
+        if dual:
+            params["mode"] = "nucleus+cell"
+            params["cell_channel"] = cell_source.label
+        label_text = (
+            f"{source.label} + {cell_source.label}" if dual else source.label
+        )
 
         def task() -> tuple:
-            if method == "classical":
-                labels = segmentation.segment_classical(
-                    data, pixel, min_area_um2=min_area, smooth_um=smooth
+            if dual:
+                if method == "classical":
+                    cells, nuclei = segmentation.segment_classical_dual(
+                        data,
+                        cell_data,
+                        pixel,
+                        min_area_um2=min_area,
+                        smooth_um=smooth,
+                        cell_diameter_um=diameter or 20.0,
+                    )
+                else:
+                    cells, nuclei = segmentation.segment_cellpose_dual(
+                        data, cell_data, pixel, diameter_um=diameter, min_area_um2=min_area
+                    )
+                result = segmentation.SegmentationResult(
+                    labels=cells,
+                    offset=offset,
+                    source_key=source.key,
+                    source_label=label_text,
+                    method=method,
+                    params=params,
+                    nucleus_labels=nuclei,
+                )
+                header, rows = segmentation.measure_cells_dual(
+                    result, channels, pixel, ratio_names=ratio_names
                 )
             else:
-                labels = segmentation.segment_cellpose(
-                    data, pixel, diameter_um=diameter, min_area_um2=min_area
+                if method == "classical":
+                    labels = segmentation.segment_classical(
+                        data, pixel, min_area_um2=min_area, smooth_um=smooth
+                    )
+                else:
+                    labels = segmentation.segment_cellpose(
+                        data, pixel, diameter_um=diameter, min_area_um2=min_area
+                    )
+                result = segmentation.SegmentationResult(
+                    labels=labels,
+                    offset=offset,
+                    source_key=source.key,
+                    source_label=label_text,
+                    method=method,
+                    params=params,
                 )
-            result = segmentation.SegmentationResult(
-                labels=labels,
-                offset=offset,
-                source_key=source.key,
-                source_label=source.label,
-                method=method,
-                params=params,
-            )
-            header, rows = segmentation.measure_cells(
-                result, channels, pixel, ring_um=ring_um, ratio_names=ratio_names
-            )
+                header, rows = segmentation.measure_cells(
+                    result, channels, pixel, ring_um=ring_um, ratio_names=ratio_names
+                )
             return result, header, rows
 
         self.seg_run_button.setEnabled(False)
@@ -2311,18 +2417,33 @@ class MainWindow(QMainWindow):
         ]
         if rows:
             table = np.asarray(rows, dtype=float)
-            areas = table[:, header.index("area_um2")]
+            dual = "cell_area_um2" in header
+            area_key = "cell_area_um2" if dual else "area_um2"
+            areas = table[:, header.index(area_key)]
             lines.append(
-                f"面积 {np.nanmean(areas):.1f} ± {np.nanstd(areas):.1f} µm²"
+                f"{'细胞面积' if dual else '面积'} {np.nanmean(areas):.1f} ± {np.nanstd(areas):.1f} µm²"
                 f"（{np.nanmin(areas):.1f}–{np.nanmax(areas):.1f}）"
             )
+            if dual:
+                nucleus_areas = table[:, header.index("nucleus_area_um2")]
+                nc_ratios = table[:, header.index("nc_area_ratio")]
+                nc_ratios = nc_ratios[np.isfinite(nc_ratios)]
+                text = f"核面积 {np.nanmean(nucleus_areas):.1f} µm²"
+                if nc_ratios.size:
+                    text += f"｜核质面积比 {np.mean(nc_ratios):.2f}"
+                lines.append(text)
+            mean_suffix = "_cell_mean" if dual else "_mean"
             channel_names = [
-                name[: -len("_mean")]
+                name[: -len(mean_suffix)]
                 for name in header
-                if name.endswith("_mean") and not name.endswith("_cyto_mean")
+                if name.endswith(mean_suffix)
+                and not name.endswith(("_cyto_mean", "_nuc_mean"))
             ]
             for name in channel_names:
-                text = f"{name}：均值 {np.nanmean(table[:, header.index(f'{name}_mean')]):.0f}"
+                text = (
+                    f"{name}：均值 "
+                    f"{np.nanmean(table[:, header.index(f'{name}{mean_suffix}')]):.0f}"
+                )
                 ratio_key = f"{name}_nuc_cyto_ratio"
                 if ratio_key in header:
                     ratios = table[:, header.index(ratio_key)]
@@ -3228,7 +3349,24 @@ def run_self_test(image_path: Path) -> None:
         seg_metadata = json.loads(seg_exported["segmentation_metadata"].read_text(encoding="utf-8"))
         if "summary" not in seg_metadata or "cell_density_per_mm2" not in seg_metadata["summary"]:
             raise RuntimeError("self-test segmentation metadata missing summary")
-    print(f"Segmentation self-test passed: {record.segmentation.count} cells")
+    window.seg_mode_combo.setCurrentIndex(1)
+    window.seg_method_combo.setCurrentIndex(0)
+    window.seg_channel_combo.setCurrentIndex(window.seg_channel_combo.count() - 1)
+    window.seg_cell_combo.setCurrentIndex(0)
+    window.run_segmentation()
+    if not window._seg_worker.wait(180000):
+        raise RuntimeError("self-test dual segmentation timed out")
+    QApplication.processEvents()
+    if record.segmentation is None or not record.segmentation.dual:
+        raise RuntimeError("self-test dual segmentation produced no dual result")
+    dual_header = record.segmentation_table[0]
+    for required in ("cell_area_um2", "nucleus_area_um2", "nc_area_ratio"):
+        if required not in dual_header:
+            raise RuntimeError(f"self-test dual table missing {required}")
+    print(
+        f"Segmentation self-test passed: {record.segmentation.count} cells "
+        f"({int(record.segmentation.nucleus_labels.max())} nuclei in dual mode)"
+    )
     window.close()
     app.quit()
 

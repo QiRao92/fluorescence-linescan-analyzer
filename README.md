@@ -20,6 +20,7 @@ A desktop GUI for quantitative fluorescence microscopy: draw and edit ROIs, extr
 - Preview all selected intensity profiles directly in the application.
 - Export full-image QC overlays, cropped ROI images, one image per selected analysis channel, a dynamic channel panel, profile CSV, curves, and JSON metadata.
 - Cell segmentation module (separate tab): classical Otsu + watershed (no extra dependencies) or Cellpose (optional, GPU-accelerated), whole image or ROI only, with boundary overlay preview and per-cell CSV / label-mask / overlay export.
+- Dual-channel segmentation: nuclei from the nuclear channel plus whole cells from a boundary channel (e.g. F-actin) give true cell/nucleus/cytoplasm compartments — N/C area ratio and per-compartment intensities with real nuc/cyto ratios.
 
 ## Channel workflow
 

@@ -33,17 +33,23 @@ SEGMENTATION_EXPORT_OPTIONS = (
 
 @dataclass
 class SegmentationResult:
-    labels: np.ndarray  # int32 label mask of the segmented region
+    labels: np.ndarray  # int32 label mask of the segmented region (cells)
     offset: tuple[int, int]  # (x, y) of the region inside the full image
     source_key: str
     source_label: str
     method: str  # "classical" | "cellpose"
     params: dict
+    nucleus_labels: np.ndarray | None = field(default=None, repr=False)
     _boundaries: np.ndarray | None = field(default=None, repr=False)
+    _nucleus_boundaries: np.ndarray | None = field(default=None, repr=False)
 
     @property
     def count(self) -> int:
         return int(self.labels.max())
+
+    @property
+    def dual(self) -> bool:
+        return self.nucleus_labels is not None
 
     def boundary_mask(self) -> np.ndarray:
         if self._boundaries is None:
@@ -52,12 +58,27 @@ class SegmentationResult:
             self._boundaries = find_boundaries(self.labels, mode="outer")
         return self._boundaries
 
-    def full_boundary_mask(self, shape: tuple[int, int]) -> np.ndarray:
+    def nucleus_boundary_mask(self) -> np.ndarray | None:
+        if self.nucleus_labels is None:
+            return None
+        if self._nucleus_boundaries is None:
+            from skimage.segmentation import find_boundaries
+
+            self._nucleus_boundaries = find_boundaries(self.nucleus_labels, mode="outer")
+        return self._nucleus_boundaries
+
+    def _place(self, region: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
         mask = np.zeros(shape, dtype=bool)
         x0, y0 = self.offset
-        region = self.boundary_mask()
         mask[y0 : y0 + region.shape[0], x0 : x0 + region.shape[1]] = region
         return mask
+
+    def full_boundary_mask(self, shape: tuple[int, int]) -> np.ndarray:
+        return self._place(self.boundary_mask(), shape)
+
+    def full_nucleus_boundary_mask(self, shape: tuple[int, int]) -> np.ndarray | None:
+        region = self.nucleus_boundary_mask()
+        return self._place(region, shape) if region is not None else None
 
 
 def segment_classical(
@@ -123,6 +144,89 @@ def segment_cellpose(
         min_size=min_px,
     )
     return np.asarray(masks, dtype=np.int32)
+
+
+def segment_classical_dual(
+    nucleus: np.ndarray,
+    cell_channel: np.ndarray,
+    pixel_size_um: float,
+    min_area_um2: float = 20.0,
+    smooth_um: float = 0.5,
+    cell_diameter_um: float = 20.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Nucleus + whole-cell segmentation with classical methods.
+
+    Nuclei come from Otsu + watershed on the nuclear channel; cells are
+    grown from each nucleus with a seeded watershed on the cell-boundary
+    channel (e.g. F-actin), limited to cell_diameter_um/2 beyond the
+    nucleus. Returns (cell_labels, nucleus_labels).
+    """
+    from skimage.filters import gaussian
+    from skimage.segmentation import watershed
+
+    nuclei = segment_classical(
+        nucleus, pixel_size_um, min_area_um2=min_area_um2, smooth_um=smooth_um
+    )
+    if nuclei.max() == 0:
+        return nuclei.copy(), nuclei
+    sigma_px = max(0.5, smooth_um / pixel_size_um)
+    elevation = gaussian(
+        np.asarray(cell_channel, dtype=np.float32), sigma=sigma_px, preserve_range=True
+    )
+    max_px = max(2, int(round(cell_diameter_um / 2.0 / pixel_size_um)))
+    distance = ndimage.distance_transform_edt(nuclei == 0)
+    cells = watershed(elevation, nuclei, mask=distance <= max_px).astype(np.int32)
+    return cells, nuclei
+
+
+def segment_cellpose_dual(
+    nucleus: np.ndarray,
+    cell_channel: np.ndarray,
+    pixel_size_um: float,
+    diameter_um: float = 20.0,
+    flow_threshold: float = 0.4,
+    min_area_um2: float = 20.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Nucleus + whole-cell segmentation with Cellpose.
+
+    Whole cells are segmented from a two-channel stack
+    [cell boundary/cytoplasm, nucleus]; nuclei from the nuclear channel
+    alone (diameter assumed to be half the cell diameter).
+    Returns (cell_labels, nucleus_labels).
+    """
+    try:
+        from cellpose import models
+    except ImportError as error:
+        raise ValueError("Cellpose 未安装：python -m pip install cellpose") from error
+    global _CELLPOSE_MODEL
+    if _CELLPOSE_MODEL is None:
+        try:
+            _CELLPOSE_MODEL = models.CellposeModel(gpu=True)
+        except Exception:
+            _CELLPOSE_MODEL = models.CellposeModel(gpu=False)
+    min_px = max(4, int(round(min_area_um2 / (pixel_size_um**2))))
+    diameter_px = diameter_um / pixel_size_um if diameter_um > 0 else None
+    stack = np.stack(
+        [
+            np.asarray(cell_channel, dtype=np.float32),
+            np.asarray(nucleus, dtype=np.float32),
+        ],
+        axis=-1,
+    )
+    cell_masks, _flows, _styles = _CELLPOSE_MODEL.eval(
+        stack,
+        channel_axis=-1,
+        diameter=diameter_px,
+        flow_threshold=flow_threshold,
+        min_size=min_px,
+    )
+    nucleus_masks, _flows, _styles = _CELLPOSE_MODEL.eval(
+        np.asarray(nucleus, dtype=np.float32),
+        diameter=diameter_px / 2.0 if diameter_px else None,
+        flow_threshold=flow_threshold,
+        min_size=min_px,
+    )
+    return np.asarray(cell_masks, dtype=np.int32), np.asarray(nucleus_masks, dtype=np.int32)
 
 
 def _drop_small_labels(labels: np.ndarray, min_px: int) -> np.ndarray:
@@ -229,14 +333,122 @@ def measure_cells(
     return header, rows
 
 
+def measure_cells_dual(
+    result: SegmentationResult,
+    channels: list[tuple[str, np.ndarray]],
+    pixel_size_um: float,
+    ratio_names: set[str] | None = None,
+) -> tuple[list[str], list[list[float]]]:
+    """Per-cell statistics with true nucleus/cytoplasm compartments.
+
+    The nucleus compartment of cell i is every nucleus pixel lying inside
+    cell i; the cytoplasm is the rest of the cell. Returns (header, rows).
+    """
+    from skimage.measure import regionprops
+
+    assert result.nucleus_labels is not None
+    cell_labels = result.labels
+    x0, y0 = result.offset
+    height, width = cell_labels.shape
+    nucleus_region = np.where(result.nucleus_labels > 0, cell_labels, 0)
+    cyto_region = np.where(result.nucleus_labels > 0, 0, cell_labels)
+    index = np.arange(1, cell_labels.max() + 1)
+    ones = np.ones(cell_labels.shape, dtype=np.float32)
+    nucleus_sizes = ndimage.sum(ones, nucleus_region, index)
+    cyto_sizes = ndimage.sum(ones, cyto_region, index)
+    wants_ratio = lambda name: ratio_names is None or name in ratio_names  # noqa: E731
+
+    header = [
+        "cell_id",
+        "centroid_x_um",
+        "centroid_y_um",
+        "cell_area_um2",
+        "nucleus_area_um2",
+        "cyto_area_um2",
+        "nc_area_ratio",
+        "equivalent_diameter_um",
+        "circularity",
+        "aspect_ratio",
+        "solidity",
+    ]
+    rows: list[list[float]] = []
+    for position, prop in enumerate(regionprops(cell_labels)):
+        perimeter_px = float(prop.perimeter)
+        circularity = (
+            min(1.0, 4.0 * np.pi * prop.area / perimeter_px**2)
+            if perimeter_px > 0
+            else float("nan")
+        )
+        minor = float(prop.minor_axis_length)
+        aspect = float(prop.major_axis_length) / minor if minor > 0 else float("nan")
+        cell_area = prop.area * pixel_size_um**2
+        nucleus_area = float(nucleus_sizes[position]) * pixel_size_um**2
+        rows.append(
+            [
+                float(prop.label),
+                (x0 + prop.centroid[1]) * pixel_size_um,
+                (y0 + prop.centroid[0]) * pixel_size_um,
+                cell_area,
+                nucleus_area,
+                float(cyto_sizes[position]) * pixel_size_um**2,
+                nucleus_area / cell_area if cell_area > 0 else float("nan"),
+                prop.equivalent_diameter * pixel_size_um,
+                circularity,
+                aspect,
+                float(prop.solidity),
+            ]
+        )
+    for name, data in channels:
+        crop = np.asarray(data[y0 : y0 + height, x0 : x0 + width], dtype=np.float32)
+        cell_means = ndimage.mean(crop, cell_labels, index)
+        cell_medians = ndimage.median(crop, cell_labels, index)
+        cell_maxima = ndimage.maximum(crop, cell_labels, index)
+        cell_sums = ndimage.sum(crop, cell_labels, index)
+        header += [
+            f"{name}_cell_mean",
+            f"{name}_cell_median",
+            f"{name}_cell_max",
+            f"{name}_cell_integrated",
+        ]
+        compartments = wants_ratio(name)
+        if compartments:
+            header += [f"{name}_nuc_mean", f"{name}_cyto_mean", f"{name}_nuc_cyto_ratio"]
+            with np.errstate(invalid="ignore", divide="ignore"):
+                nucleus_means = np.where(
+                    nucleus_sizes > 0,
+                    ndimage.mean(crop, nucleus_region, index),
+                    np.nan,
+                )
+                cyto_means = np.where(
+                    cyto_sizes > 0, ndimage.mean(crop, cyto_region, index), np.nan
+                )
+        for position, (row, mean, median, maximum, total) in enumerate(
+            zip(rows, cell_means, cell_medians, cell_maxima, cell_sums)
+        ):
+            row += [float(mean), float(median), float(maximum), float(total)]
+            if compartments:
+                nuc_mean = float(nucleus_means[position])
+                cyto_mean = float(cyto_means[position])
+                ratio = (
+                    nuc_mean / cyto_mean
+                    if np.isfinite(nuc_mean) and np.isfinite(cyto_mean) and cyto_mean > 0
+                    else float("nan")
+                )
+                row += [nuc_mean, cyto_mean, ratio]
+    return header, rows
+
+
 def make_segmentation_overlay(
     composite_rgb: np.ndarray,
     result: SegmentationResult,
     color: tuple[int, int, int] = (255, 214, 0),
+    nucleus_color: tuple[int, int, int] = (0, 229, 255),
 ) -> np.ndarray:
     overlay = np.array(composite_rgb, copy=True)
-    mask = result.full_boundary_mask(overlay.shape[:2])
-    overlay[mask] = color
+    overlay[result.full_boundary_mask(overlay.shape[:2])] = color
+    nucleus_mask = result.full_nucleus_boundary_mask(overlay.shape[:2])
+    if nucleus_mask is not None:
+        overlay[nucleus_mask] = nucleus_color
     return overlay
 
 
@@ -266,9 +478,14 @@ def export_segmentation(
     metadata_path = output_dir / f"{stem}_segmentation.json"
 
     exported: dict[str, Path] = {}
-    header, rows = measure_cells(
-        result, channels, pixel_size_um, ring_um=ring_um, ratio_names=ratio_names
-    )
+    if result.dual:
+        header, rows = measure_cells_dual(
+            result, channels, pixel_size_um, ratio_names=ratio_names
+        )
+    else:
+        header, rows = measure_cells(
+            result, channels, pixel_size_um, ring_um=ring_um, ratio_names=ratio_names
+        )
     if "cells_csv" in selected:
         with csv_path.open("w", newline="", encoding="utf-8-sig") as handle:
             writer = csv.writer(handle)
@@ -281,11 +498,13 @@ def export_segmentation(
         Image.fromarray(overlay).save(overlay_path, dpi=(300, 300))
         exported["segmentation_overlay"] = overlay_path
     if "labels" in selected:
-        tifffile.imwrite(
-            labels_path,
-            result.labels.astype(np.uint16 if result.count < 65536 else np.int32),
-        )
+        label_dtype = np.uint16 if result.count < 65536 else np.int32
+        tifffile.imwrite(labels_path, result.labels.astype(label_dtype))
         exported["labels"] = labels_path
+        if result.nucleus_labels is not None:
+            nuclei_path = output_dir / f"{stem}_labels_nuclei.tif"
+            tifffile.imwrite(nuclei_path, result.nucleus_labels.astype(label_dtype))
+            exported["labels_nuclei"] = nuclei_path
 
     region_area_mm2 = (
         result.labels.shape[0] * result.labels.shape[1] * (pixel_size_um / 1000.0) ** 2
@@ -296,21 +515,30 @@ def export_segmentation(
     }
     if rows:
         table = np.asarray(rows, dtype=float)
-        for column_name in ("area_um2", "equivalent_diameter_um", "circularity"):
+        summary_columns = (
+            ("cell_area_um2", "nucleus_area_um2", "nc_area_ratio", "equivalent_diameter_um", "circularity")
+            if result.dual
+            else ("area_um2", "equivalent_diameter_um", "circularity")
+        )
+        for column_name in summary_columns:
             column = table[:, header.index(column_name)]
-            summary[f"mean_{column_name}"] = float(np.nanmean(column))
+            column = column[np.isfinite(column)]
+            if column.size:
+                summary[f"mean_{column_name}"] = float(np.mean(column))
         for name, _data in channels:
-            key = f"{name}_mean"
-            if key in header:
-                summary[f"mean_{key}"] = float(np.nanmean(table[:, header.index(key)]))
-            ratio_key = f"{name}_nuc_cyto_ratio"
-            if ratio_key in header:
-                summary[f"mean_{ratio_key}"] = float(np.nanmean(table[:, header.index(ratio_key)]))
+            for key in (f"{name}_mean", f"{name}_cell_mean", f"{name}_nuc_cyto_ratio"):
+                if key in header:
+                    values = table[:, header.index(key)]
+                    values = values[np.isfinite(values)]
+                    if values.size:
+                        summary[f"mean_{key}"] = float(np.mean(values))
     metadata = {
         "source_image": str(source_image),
         "pixel_size_um": pixel_size_um,
         "segmentation_channel": result.source_label,
         "method": result.method,
+        "mode": "nucleus+cell" if result.dual else "single",
+        "nucleus_count": int(result.nucleus_labels.max()) if result.dual else None,
         "params": result.params,
         "cyto_ring_um": ring_um,
         "region_offset_xy_px": list(result.offset),
