@@ -30,6 +30,13 @@ SEGMENTATION_EXPORT_OPTIONS = (
     ("segmentation_metadata", "参数/汇总 JSON"),
 )
 
+METRIC_OPTIONS = (
+    ("morph_basic", "基本形态（面积、等效直径）"),
+    ("morph_shape", "形态细节（周长、圆度、长宽比、实度）"),
+    ("intensity_extra", "强度统计（median / max / integrated）"),
+    ("compartments", "核/质或核/核周区室指标"),
+)
+
 
 @dataclass
 class SegmentationResult:
@@ -246,6 +253,7 @@ def measure_cells(
     pixel_size_um: float,
     ring_um: float = 1.5,
     ratio_names: set[str] | None = None,
+    metrics: set[str] | None = None,
 ) -> tuple[list[str], list[list[float]]]:
     """Per-cell morphology, intensity, and nuclear/cytoplasm statistics.
 
@@ -256,53 +264,53 @@ def measure_cells(
         nuc_peri_ratio (nucleus / perinuclear), not a true N/C ratio.
     ratio_names: channel names that get perinuclear/ratio columns;
         None means every channel, an empty set means none.
+    metrics: METRIC_OPTIONS keys to include (None means all); cell id,
+        centroid, and per-channel mean are always present.
     Returns (header, rows) ready for CSV writing.
     """
     from skimage.measure import regionprops
     from skimage.segmentation import expand_labels
 
+    include = lambda key: metrics is None or key in metrics  # noqa: E731
     labels = result.labels
     x0, y0 = result.offset
     height, width = labels.shape
-    header = [
-        "cell_id",
-        "centroid_x_um",
-        "centroid_y_um",
-        "area_um2",
-        "equivalent_diameter_um",
-        "perimeter_um",
-        "circularity",
-        "aspect_ratio",
-        "solidity",
-    ]
+    header = ["cell_id", "centroid_x_um", "centroid_y_um"]
+    if include("morph_basic"):
+        header += ["area_um2", "equivalent_diameter_um"]
+    if include("morph_shape"):
+        header += ["perimeter_um", "circularity", "aspect_ratio", "solidity"]
     rows: list[list[float]] = []
     for prop in regionprops(labels):
-        perimeter_px = float(prop.perimeter)
-        circularity = (
-            min(1.0, 4.0 * np.pi * prop.area / perimeter_px**2)
-            if perimeter_px > 0
-            else float("nan")
-        )
-        minor = float(prop.minor_axis_length)
-        aspect = float(prop.major_axis_length) / minor if minor > 0 else float("nan")
-        rows.append(
-            [
-                float(prop.label),
-                (x0 + prop.centroid[1]) * pixel_size_um,
-                (y0 + prop.centroid[0]) * pixel_size_um,
+        row = [
+            float(prop.label),
+            (x0 + prop.centroid[1]) * pixel_size_um,
+            (y0 + prop.centroid[0]) * pixel_size_um,
+        ]
+        if include("morph_basic"):
+            row += [
                 prop.area * pixel_size_um**2,
                 prop.equivalent_diameter * pixel_size_um,
-                perimeter_px * pixel_size_um,
-                circularity,
-                aspect,
-                float(prop.solidity),
             ]
-        )
+        if include("morph_shape"):
+            perimeter_px = float(prop.perimeter)
+            circularity = (
+                min(1.0, 4.0 * np.pi * prop.area / perimeter_px**2)
+                if perimeter_px > 0
+                else float("nan")
+            )
+            minor = float(prop.minor_axis_length)
+            aspect = (
+                float(prop.major_axis_length) / minor if minor > 0 else float("nan")
+            )
+            row += [perimeter_px * pixel_size_um, circularity, aspect, float(prop.solidity)]
+        rows.append(row)
     index = np.arange(1, labels.max() + 1)
     wants_ratio = lambda name: ratio_names is None or name in ratio_names  # noqa: E731
     ring = None
     if (
-        ring_um > 0
+        include("compartments")
+        and ring_um > 0
         and labels.max() > 0
         and any(wants_ratio(name) for name, _data in channels)
     ):
@@ -313,10 +321,13 @@ def measure_cells(
     for name, data in channels:
         crop = np.asarray(data[y0 : y0 + height, x0 : x0 + width], dtype=np.float32)
         means = ndimage.mean(crop, labels, index)
-        medians = ndimage.median(crop, labels, index)
-        maxima = ndimage.maximum(crop, labels, index)
-        sums = ndimage.sum(crop, labels, index)
-        header += [f"{name}_mean", f"{name}_median", f"{name}_max", f"{name}_integrated"]
+        header.append(f"{name}_mean")
+        extra = include("intensity_extra")
+        if extra:
+            medians = ndimage.median(crop, labels, index)
+            maxima = ndimage.maximum(crop, labels, index)
+            sums = ndimage.sum(crop, labels, index)
+            header += [f"{name}_median", f"{name}_max", f"{name}_integrated"]
         channel_ring = ring if wants_ratio(name) else None
         if channel_ring is not None:
             header += [f"{name}_perinuclear_mean", f"{name}_nuc_peri_ratio"]
@@ -324,10 +335,14 @@ def measure_cells(
                 ring_means = np.where(
                     ring_sizes > 0, ndimage.mean(crop, channel_ring, index), np.nan
                 )
-        for position, (row, mean, median, maximum, total) in enumerate(
-            zip(rows, means, medians, maxima, sums)
-        ):
-            row += [float(mean), float(median), float(maximum), float(total)]
+        for position, (row, mean) in enumerate(zip(rows, means)):
+            row.append(float(mean))
+            if extra:
+                row += [
+                    float(medians[position]),
+                    float(maxima[position]),
+                    float(sums[position]),
+                ]
             if channel_ring is not None:
                 cyto = float(ring_means[position])
                 ratio = float(mean) / cyto if np.isfinite(cyto) and cyto > 0 else float("nan")
@@ -340,15 +355,18 @@ def measure_cells_dual(
     channels: list[tuple[str, np.ndarray]],
     pixel_size_um: float,
     ratio_names: set[str] | None = None,
+    metrics: set[str] | None = None,
 ) -> tuple[list[str], list[list[float]]]:
     """Per-cell statistics with true nucleus/cytoplasm compartments.
 
     The nucleus compartment of cell i is every nucleus pixel lying inside
-    cell i; the cytoplasm is the rest of the cell. Returns (header, rows).
+    cell i; the cytoplasm is the rest of the cell. metrics selects
+    METRIC_OPTIONS groups (None means all). Returns (header, rows).
     """
     from skimage.measure import regionprops
 
     assert result.nucleus_labels is not None
+    include = lambda key: metrics is None or key in metrics  # noqa: E731
     cell_labels = result.labels
     x0, y0 = result.offset
     height, width = cell_labels.shape
@@ -360,59 +378,58 @@ def measure_cells_dual(
     cyto_sizes = ndimage.sum(ones, cyto_region, index)
     wants_ratio = lambda name: ratio_names is None or name in ratio_names  # noqa: E731
 
-    header = [
-        "cell_id",
-        "centroid_x_um",
-        "centroid_y_um",
-        "cell_area_um2",
-        "nucleus_area_um2",
-        "cyto_area_um2",
-        "nc_area_ratio",
-        "equivalent_diameter_um",
-        "circularity",
-        "aspect_ratio",
-        "solidity",
-    ]
+    header = ["cell_id", "centroid_x_um", "centroid_y_um"]
+    if include("morph_basic"):
+        header += ["cell_area_um2", "equivalent_diameter_um"]
+    if include("compartments"):
+        header += ["nucleus_area_um2", "cyto_area_um2", "nc_area_ratio"]
+    if include("morph_shape"):
+        header += ["perimeter_um", "circularity", "aspect_ratio", "solidity"]
     rows: list[list[float]] = []
     for position, prop in enumerate(regionprops(cell_labels)):
-        perimeter_px = float(prop.perimeter)
-        circularity = (
-            min(1.0, 4.0 * np.pi * prop.area / perimeter_px**2)
-            if perimeter_px > 0
-            else float("nan")
-        )
-        minor = float(prop.minor_axis_length)
-        aspect = float(prop.major_axis_length) / minor if minor > 0 else float("nan")
+        row = [
+            float(prop.label),
+            (x0 + prop.centroid[1]) * pixel_size_um,
+            (y0 + prop.centroid[0]) * pixel_size_um,
+        ]
         cell_area = prop.area * pixel_size_um**2
-        nucleus_area = float(nucleus_sizes[position]) * pixel_size_um**2
-        rows.append(
-            [
-                float(prop.label),
-                (x0 + prop.centroid[1]) * pixel_size_um,
-                (y0 + prop.centroid[0]) * pixel_size_um,
-                cell_area,
+        if include("morph_basic"):
+            row += [cell_area, prop.equivalent_diameter * pixel_size_um]
+        if include("compartments"):
+            nucleus_area = float(nucleus_sizes[position]) * pixel_size_um**2
+            row += [
                 nucleus_area,
                 float(cyto_sizes[position]) * pixel_size_um**2,
                 nucleus_area / cell_area if cell_area > 0 else float("nan"),
-                prop.equivalent_diameter * pixel_size_um,
-                circularity,
-                aspect,
-                float(prop.solidity),
             ]
-        )
+        if include("morph_shape"):
+            perimeter_px = float(prop.perimeter)
+            circularity = (
+                min(1.0, 4.0 * np.pi * prop.area / perimeter_px**2)
+                if perimeter_px > 0
+                else float("nan")
+            )
+            minor = float(prop.minor_axis_length)
+            aspect = (
+                float(prop.major_axis_length) / minor if minor > 0 else float("nan")
+            )
+            row += [perimeter_px * pixel_size_um, circularity, aspect, float(prop.solidity)]
+        rows.append(row)
     for name, data in channels:
         crop = np.asarray(data[y0 : y0 + height, x0 : x0 + width], dtype=np.float32)
         cell_means = ndimage.mean(crop, cell_labels, index)
-        cell_medians = ndimage.median(crop, cell_labels, index)
-        cell_maxima = ndimage.maximum(crop, cell_labels, index)
-        cell_sums = ndimage.sum(crop, cell_labels, index)
-        header += [
-            f"{name}_cell_mean",
-            f"{name}_cell_median",
-            f"{name}_cell_max",
-            f"{name}_cell_integrated",
-        ]
-        compartments = wants_ratio(name)
+        header.append(f"{name}_cell_mean")
+        extra = include("intensity_extra")
+        if extra:
+            cell_medians = ndimage.median(crop, cell_labels, index)
+            cell_maxima = ndimage.maximum(crop, cell_labels, index)
+            cell_sums = ndimage.sum(crop, cell_labels, index)
+            header += [
+                f"{name}_cell_median",
+                f"{name}_cell_max",
+                f"{name}_cell_integrated",
+            ]
+        compartments = include("compartments") and wants_ratio(name)
         if compartments:
             header += [f"{name}_nuc_mean", f"{name}_cyto_mean", f"{name}_nuc_cyto_ratio"]
             with np.errstate(invalid="ignore", divide="ignore"):
@@ -424,10 +441,14 @@ def measure_cells_dual(
                 cyto_means = np.where(
                     cyto_sizes > 0, ndimage.mean(crop, cyto_region, index), np.nan
                 )
-        for position, (row, mean, median, maximum, total) in enumerate(
-            zip(rows, cell_means, cell_medians, cell_maxima, cell_sums)
-        ):
-            row += [float(mean), float(median), float(maximum), float(total)]
+        for position, (row, mean) in enumerate(zip(rows, cell_means)):
+            row.append(float(mean))
+            if extra:
+                row += [
+                    float(cell_medians[position]),
+                    float(cell_maxima[position]),
+                    float(cell_sums[position]),
+                ]
             if compartments:
                 nuc_mean = float(nucleus_means[position])
                 cyto_mean = float(cyto_means[position])
@@ -465,6 +486,7 @@ def export_segmentation(
     ring_um: float = 1.5,
     selected: set[str] | None = None,
     ratio_names: set[str] | None = None,
+    metrics: set[str] | None = None,
 ) -> dict[str, Path]:
     import tifffile
     from PIL import Image
@@ -482,11 +504,16 @@ def export_segmentation(
     exported: dict[str, Path] = {}
     if result.dual:
         header, rows = measure_cells_dual(
-            result, channels, pixel_size_um, ratio_names=ratio_names
+            result, channels, pixel_size_um, ratio_names=ratio_names, metrics=metrics
         )
     else:
         header, rows = measure_cells(
-            result, channels, pixel_size_um, ring_um=ring_um, ratio_names=ratio_names
+            result,
+            channels,
+            pixel_size_um,
+            ring_um=ring_um,
+            ratio_names=ratio_names,
+            metrics=metrics,
         )
     if "cells_csv" in selected:
         with csv_path.open("w", newline="", encoding="utf-8-sig") as handle:
@@ -523,6 +550,8 @@ def export_segmentation(
             else ("area_um2", "equivalent_diameter_um", "circularity")
         )
         for column_name in summary_columns:
+            if column_name not in header:
+                continue
             column = table[:, header.index(column_name)]
             column = column[np.isfinite(column)]
             if column.size:
@@ -548,6 +577,7 @@ def export_segmentation(
         "nucleus_count": int(result.nucleus_labels.max()) if result.dual else None,
         "params": result.params,
         "cyto_ring_um": ring_um,
+        "metric_groups": sorted(metrics) if metrics is not None else "all",
         "region_offset_xy_px": list(result.offset),
         "region_size_xy_px": [result.labels.shape[1], result.labels.shape[0]],
         "cell_count": result.count,

@@ -1688,6 +1688,8 @@ class ExportOptionsDialog(QDialog):
         options: tuple[tuple[str, str], ...],
         selected: set[str],
         parent: QWidget | None = None,
+        metric_options: tuple[tuple[str, str], ...] | None = None,
+        metric_selected: set[str] | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("选择导出内容")
@@ -1706,6 +1708,24 @@ class ExportOptionsDialog(QDialog):
             self._checks[key] = checkbox
             grid.addWidget(checkbox, position // 2, position % 2)
         layout.addLayout(grid)
+        self._metric_checks: dict[str, QCheckBox] = {}
+        if metric_options:
+            metric_hint = QLabel("包含的指标（作用于单细胞 CSV 与汇总 JSON）：")
+            layout.addSpacing(6)
+            layout.addWidget(metric_hint)
+            metric_box = QVBoxLayout()
+            metric_box.setSpacing(4)
+            for key, label in metric_options:
+                checkbox = QCheckBox(label)
+                checkbox.setChecked(
+                    metric_selected is None or key in metric_selected
+                )
+                self._metric_checks[key] = checkbox
+                metric_box.addWidget(checkbox)
+            metric_note = QLabel("细胞编号、质心坐标和各通道 mean 强度始终包含。")
+            metric_note.setObjectName("hint")
+            metric_box.addWidget(metric_note)
+            layout.addLayout(metric_box)
         quick_row = QHBoxLayout()
         select_all = QPushButton("全选")
         select_none = QPushButton("全不选")
@@ -1728,6 +1748,13 @@ class ExportOptionsDialog(QDialog):
 
     def selected(self) -> set[str]:
         return {key for key, checkbox in self._checks.items() if checkbox.isChecked()}
+
+    def selected_metrics(self) -> set[str]:
+        return {
+            key
+            for key, checkbox in self._metric_checks.items()
+            if checkbox.isChecked()
+        }
 
     def _accept_if_any(self) -> None:
         if not self.selected():
@@ -1780,6 +1807,11 @@ class MainWindow(QMainWindow):
             for key, _label in segmentation.SEGMENTATION_EXPORT_OPTIONS
             if settings.value(f"segmentation/{key}", True, type=bool)
         }
+        self.seg_metric_selection = {
+            key
+            for key, _label in segmentation.METRIC_OPTIONS
+            if settings.value(f"segmentation_metrics/{key}", True, type=bool)
+        }
 
     def _save_export_settings(self) -> None:
         settings = QSettings("FluoQuant", "export")
@@ -1787,6 +1819,10 @@ class MainWindow(QMainWindow):
             settings.setValue(f"line/{key}", key in self.line_export_selection)
         for key, _label in segmentation.SEGMENTATION_EXPORT_OPTIONS:
             settings.setValue(f"segmentation/{key}", key in self.seg_export_selection)
+        for key, _label in segmentation.METRIC_OPTIONS:
+            settings.setValue(
+                f"segmentation_metrics/{key}", key in self.seg_metric_selection
+            )
 
     def _ask_export_selection(
         self, options: tuple[tuple[str, str], ...], attribute: str
@@ -2496,11 +2532,19 @@ class MainWindow(QMainWindow):
         if record is None or record.segmentation is None:
             QMessageBox.warning(self, "无法导出", "请先运行细胞分割。")
             return
-        seg_selected = self._ask_export_selection(
-            segmentation.SEGMENTATION_EXPORT_OPTIONS, "seg_export_selection"
+        dialog = ExportOptionsDialog(
+            segmentation.SEGMENTATION_EXPORT_OPTIONS,
+            self.seg_export_selection,
+            self,
+            metric_options=segmentation.METRIC_OPTIONS,
+            metric_selected=self.seg_metric_selection,
         )
-        if seg_selected is None:
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
+        seg_selected = dialog.selected()
+        self.seg_export_selection = seg_selected
+        self.seg_metric_selection = dialog.selected_metrics()
+        self._save_export_settings()
         folder = self._choose_export_dir()
         if folder is None:
             return
@@ -2519,6 +2563,7 @@ class MainWindow(QMainWindow):
             ratio_names=None
             if record.segmentation.dual
             else self._selected_ratio_names(),
+            metrics=self.seg_metric_selection,
         )
         self.last_export_dir = folder
         self.statusBar().showMessage(
@@ -3369,6 +3414,20 @@ def run_self_test(image_path: Path) -> None:
         seg_metadata = json.loads(seg_exported["segmentation_metadata"].read_text(encoding="utf-8"))
         if "summary" not in seg_metadata or "cell_density_per_mm2" not in seg_metadata["summary"]:
             raise RuntimeError("self-test segmentation metadata missing summary")
+        subset_exported = segmentation.export_segmentation(
+            record.segmentation,
+            record.rgb,
+            [(channel.label, channel.data) for channel in record.source_channels],
+            record.pixel_size_um,
+            record.path,
+            Path(folder),
+            "metric_subset",
+            selected={"cells_csv"},
+            metrics={"morph_basic"},
+        )
+        subset_header = subset_exported["cells_csv"].read_text(encoding="utf-8-sig").splitlines()[0]
+        if "area_um2" not in subset_header or "circularity" in subset_header or "_median" in subset_header:
+            raise RuntimeError("self-test metric subset export produced wrong columns")
     window.seg_mode_combo.setCurrentIndex(1)
     window.seg_method_combo.setCurrentIndex(0)
     window.seg_channel_combo.setCurrentIndex(window.seg_channel_combo.count() - 1)
