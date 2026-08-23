@@ -2110,6 +2110,7 @@ class MainWindow(QMainWindow):
         self._seg_ratio_selected: set[str] = set()
         self.seg_roi_check = QCheckBox("仅分割当前 ROI 区域")
         self.seg_roi_check.setToolTip("大图建议先画 ROI 再分割；不勾选则分割整幅图像")
+        self.seg_form = form
         form.addRow("分割模式", self.seg_mode_combo)
         form.addRow("核通道", self.seg_channel_combo)
         form.addRow("胞体通道", self.seg_cell_combo)
@@ -2185,12 +2186,14 @@ class MainWindow(QMainWindow):
     def _seg_method_changed(self, _index: int = 0) -> None:
         classical = self.seg_method_combo.currentIndex() == 0
         dual = self.seg_mode_combo.currentIndex() == 1
-        self.seg_cell_combo.setEnabled(dual)
-        self.seg_ratio_row_label.setText("核/质比通道" if dual else "核/核周比通道")
+        # 双通道模式：核/质指标对全部通道自动计算，隐藏环参数和勾选列表；
+        # 单通道模式：隐藏胞体通道。
+        self.seg_form.setRowVisible(self.seg_cell_combo, dual)
+        self.seg_form.setRowVisible(self.seg_ring_spin, not dual)
+        self.seg_form.setRowVisible(self.seg_ratio_widget, not dual)
         self.seg_smooth_spin.setEnabled(classical)
         # 双通道模式下经典方法也用直径限制细胞从核向外的扩展范围
         self.seg_diameter_spin.setEnabled(dual or not classical)
-        self.seg_ring_spin.setEnabled(not dual)
         if dual and self.seg_diameter_spin.value() == 10.0:
             self.seg_diameter_spin.setValue(20.0)
         elif not dual and self.seg_diameter_spin.value() == 20.0:
@@ -2314,7 +2317,7 @@ class MainWindow(QMainWindow):
         diameter = self.seg_diameter_spin.value()
         ring_um = self.seg_ring_spin.value()
         channels = self._measured_channels(record)
-        ratio_names = self._selected_ratio_names()
+        ratio_names = None if dual else self._selected_ratio_names()
         params = {"min_area_um2": min_area}
         if method == "classical":
             params["smooth_um"] = smooth
@@ -2513,7 +2516,9 @@ class MainWindow(QMainWindow):
             safe_stem(record.path),
             ring_um=self.seg_ring_spin.value(),
             selected=seg_selected,
-            ratio_names=self._selected_ratio_names(),
+            ratio_names=None
+            if record.segmentation.dual
+            else self._selected_ratio_names(),
         )
         self.last_export_dir = folder
         self.statusBar().showMessage(
@@ -3378,6 +3383,13 @@ def run_self_test(image_path: Path) -> None:
     for required in ("cell_area_um2", "nucleus_area_um2", "nc_area_ratio"):
         if required not in dual_header:
             raise RuntimeError(f"self-test dual table missing {required}")
+    dual_ratio_columns = [
+        name for name in dual_header if name.endswith("_nuc_cyto_ratio")
+    ]
+    if len(dual_ratio_columns) != len(record.source_channels):
+        raise RuntimeError(
+            "self-test dual mode should compute nuc/cyto ratios for every channel"
+        )
     print(
         f"Segmentation self-test passed: {record.segmentation.count} cells "
         f"({int(record.segmentation.nucleus_labels.max())} nuclei in dual mode)"
