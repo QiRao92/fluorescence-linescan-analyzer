@@ -1654,7 +1654,11 @@ class SegSummaryCanvas(FigureCanvasQTAgg):
             ]
         else:
             panels = [("面积 (µm²)", table[:, header.index("area_um2")])]
-        ratio_columns = [name for name in header if name.endswith("_nuc_cyto_ratio")]
+        ratio_columns = [
+            name
+            for name in header
+            if name.endswith(("_nuc_cyto_ratio", "_nuc_peri_ratio"))
+        ]
         ratio_columns.sort(
             key=lambda name: bool(re.match(r"^(c\d|Ch\d|R|G|B|Gray)", name))
         )
@@ -1662,7 +1666,9 @@ class SegSummaryCanvas(FigureCanvasQTAgg):
             values = table[:, header.index(ratio_columns[0])]
             values = values[np.isfinite(values)]
             if values.size:
-                panels.append((ratio_columns[0].replace("_nuc_cyto_ratio", " 核/质比"), values))
+                title = ratio_columns[0].replace("_nuc_cyto_ratio", " 核/质比")
+                title = title.replace("_nuc_peri_ratio", " 核/核周比")
+                panels.append((title, values))
         for position, (title, values) in enumerate(panels, start=1):
             axis = self.figure.add_subplot(1, len(panels), position)
             axis.hist(values, bins=min(24, max(6, len(values) // 3)), color="#0072B2", alpha=0.85)
@@ -2053,9 +2059,10 @@ class MainWindow(QMainWindow):
         self.seg_mode_combo = QComboBox()
         self.seg_mode_combo.addItems(["单通道（核/对象）", "双通道（核 + 胞体）"])
         self.seg_mode_combo.setToolTip(
-            "单通道：只分割一个通道里的对象（如 DAPI 核），胞质用向外扩环近似。\n"
+            "单通道：只分割一个通道里的对象（如 DAPI 核），核周环近似胞质，\n"
+            "得到的是核/核周比（核质比的近似）。\n"
             "双通道：核通道分核 + 胞体通道（如 F-actin）勾勒细胞边界，\n"
-            "得到真实的细胞/核/胞质三个区室和核质面积比。"
+            "得到真实的细胞/核/胞质三个区室、核质面积比和核/质强度比。"
         )
         self.seg_channel_combo = QComboBox()
         self.seg_channel_combo.setToolTip("选择用于分割的通道，通常是核染色（DAPI/Hoechst）")
@@ -2091,8 +2098,9 @@ class MainWindow(QMainWindow):
         self.seg_ring_spin.setSpecialValueText("不测量")
         self.seg_ring_spin.setValue(1.5)
         self.seg_ring_spin.setToolTip(
-            "以每个分割对象（通常为细胞核）向外扩展形成胞质环，\n"
-            "对下方勾选的通道计算胞质强度和核/质强度比；设为 0 关闭。"
+            "以每个分割对象（通常为细胞核）向外扩展形成核周环（近似胞质），\n"
+            "对下方勾选的通道计算核周强度和核/核周强度比；设为 0 关闭。\n"
+            "如需真实的核/质比，请使用双通道分割模式。"
         )
         self.seg_ratio_widget = QWidget()
         self.seg_ratio_layout = QVBoxLayout(self.seg_ratio_widget)
@@ -2109,8 +2117,9 @@ class MainWindow(QMainWindow):
         form.addRow("最小面积", self.seg_min_area_spin)
         form.addRow("平滑尺度", self.seg_smooth_spin)
         form.addRow("目标直径", self.seg_diameter_spin)
-        form.addRow("胞质环宽", self.seg_ring_spin)
-        form.addRow("核/质比通道", self.seg_ratio_widget)
+        form.addRow("核周环宽", self.seg_ring_spin)
+        self.seg_ratio_row_label = QLabel("核/核周比通道")
+        form.addRow(self.seg_ratio_row_label, self.seg_ratio_widget)
         form.addRow(self.seg_roi_check)
         layout.addWidget(setup)
 
@@ -2177,6 +2186,7 @@ class MainWindow(QMainWindow):
         classical = self.seg_method_combo.currentIndex() == 0
         dual = self.seg_mode_combo.currentIndex() == 1
         self.seg_cell_combo.setEnabled(dual)
+        self.seg_ratio_row_label.setText("核/质比通道" if dual else "核/核周比通道")
         self.seg_smooth_spin.setEnabled(classical)
         # 双通道模式下经典方法也用直径限制细胞从核向外的扩展范围
         self.seg_diameter_spin.setEnabled(dual or not classical)
@@ -2437,19 +2447,23 @@ class MainWindow(QMainWindow):
                 name[: -len(mean_suffix)]
                 for name in header
                 if name.endswith(mean_suffix)
-                and not name.endswith(("_cyto_mean", "_nuc_mean"))
+                and not name.endswith(("_cyto_mean", "_nuc_mean", "_perinuclear_mean"))
             ]
             for name in channel_names:
                 text = (
                     f"{name}：均值 "
                     f"{np.nanmean(table[:, header.index(f'{name}{mean_suffix}')]):.0f}"
                 )
-                ratio_key = f"{name}_nuc_cyto_ratio"
-                if ratio_key in header:
-                    ratios = table[:, header.index(ratio_key)]
-                    ratios = ratios[np.isfinite(ratios)]
-                    if ratios.size:
-                        text += f"｜核/质比 {np.mean(ratios):.2f}"
+                for ratio_key, ratio_label in (
+                    (f"{name}_nuc_cyto_ratio", "核/质比"),
+                    (f"{name}_nuc_peri_ratio", "核/核周比"),
+                ):
+                    if ratio_key in header:
+                        ratios = table[:, header.index(ratio_key)]
+                        ratios = ratios[np.isfinite(ratios)]
+                        if ratios.size:
+                            text += f"｜{ratio_label} {np.mean(ratios):.2f}"
+                        break
                 lines.append(text)
         self.seg_summary_label.setText("\n".join(lines))
         self.seg_summary_canvas.show_table(header, rows)
@@ -3324,7 +3338,8 @@ def run_self_test(image_path: Path) -> None:
     if "细胞数" not in window.seg_summary_label.text():
         raise RuntimeError("self-test segmentation summary display not updated")
     if any(
-        name.endswith("_nuc_cyto_ratio") for name in record.segmentation_table[0]
+        name.endswith(("_nuc_cyto_ratio", "_nuc_peri_ratio"))
+        for name in record.segmentation_table[0]
     ):
         raise RuntimeError("self-test ratio columns present although none selected")
     if len(window.seg_ratio_checks) != len(record.source_channels):
@@ -3343,7 +3358,7 @@ def run_self_test(image_path: Path) -> None:
         if seg_missing:
             raise RuntimeError(f"self-test segmentation export missing: {seg_missing}")
         seg_header = seg_exported["cells_csv"].read_text(encoding="utf-8-sig").splitlines()[0]
-        for required in ("_mean", "_median", "circularity", "_cyto_mean", "_nuc_cyto_ratio"):
+        for required in ("_mean", "_median", "circularity", "_perinuclear_mean", "_nuc_peri_ratio"):
             if required not in seg_header:
                 raise RuntimeError(f"self-test segmentation CSV missing {required} columns")
         seg_metadata = json.loads(seg_exported["segmentation_metadata"].read_text(encoding="utf-8"))

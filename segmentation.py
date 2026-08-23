@@ -250,9 +250,11 @@ def measure_cells(
     """Per-cell morphology, intensity, and nuclear/cytoplasm statistics.
 
     channels: (column name, full-image intensity array) pairs.
-    ring_um: width of the cytoplasmic ring grown outward from each
+    ring_um: width of the perinuclear ring grown outward from each
         segmented object (usually a nucleus); 0 disables ring columns.
-    ratio_names: channel names that get cyto/nuc-cyto-ratio columns;
+        The ring approximates cytoplasm, so the ratio is reported as
+        nuc_peri_ratio (nucleus / perinuclear), not a true N/C ratio.
+    ratio_names: channel names that get perinuclear/ratio columns;
         None means every channel, an empty set means none.
     Returns (header, rows) ready for CSV writing.
     """
@@ -317,7 +319,7 @@ def measure_cells(
         header += [f"{name}_mean", f"{name}_median", f"{name}_max", f"{name}_integrated"]
         channel_ring = ring if wants_ratio(name) else None
         if channel_ring is not None:
-            header += [f"{name}_cyto_mean", f"{name}_nuc_cyto_ratio"]
+            header += [f"{name}_perinuclear_mean", f"{name}_nuc_peri_ratio"]
             with np.errstate(invalid="ignore", divide="ignore"):
                 ring_means = np.where(
                     ring_sizes > 0, ndimage.mean(crop, channel_ring, index), np.nan
@@ -526,7 +528,12 @@ def export_segmentation(
             if column.size:
                 summary[f"mean_{column_name}"] = float(np.mean(column))
         for name, _data in channels:
-            for key in (f"{name}_mean", f"{name}_cell_mean", f"{name}_nuc_cyto_ratio"):
+            for key in (
+                f"{name}_mean",
+                f"{name}_cell_mean",
+                f"{name}_nuc_cyto_ratio",
+                f"{name}_nuc_peri_ratio",
+            ):
                 if key in header:
                     values = table[:, header.index(key)]
                     values = values[np.isfinite(values)]
@@ -548,8 +555,10 @@ def export_segmentation(
         "summary": summary,
         "note": (
             "labels.tif is the label mask (0 = background); cell_id in the CSV matches label values. "
-            "cyto columns sample a ring grown outward from each segmented object (usually a nucleus); "
-            "nuc_cyto_ratio = object mean / ring mean."
+            "Single mode: perinuclear columns sample a ring grown outward from each segmented object; "
+            "nuc_peri_ratio = object mean / ring mean (cytoplasm proxy, not a true N/C ratio). "
+            "Dual mode: cyto columns are the true cytoplasm compartment (cell minus nucleus) and "
+            "nuc_cyto_ratio = nucleus mean / cytoplasm mean."
         ),
     }
     if "segmentation_metadata" in selected:
