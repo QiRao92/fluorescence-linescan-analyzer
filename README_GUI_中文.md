@@ -1,5 +1,16 @@
 # FluoQuant
 
+> **曾用名**（保留以便检索）：Fluorescence Line-scan Analyzer（`fluorescence_linescan_analyzer.py`），最初为 HNF4A 线扫描工具（`hnf4a_linescan_gui.py`）。同一软件，因功能扩展至线扫描之外而更名为 FluoQuant。
+
+## 安装（电脑上没有 Python 环境时）
+
+1. 把整个软件文件夹拷贝到本机；
+2. 双击 `install_FluoQuant.bat`，等待自动下载便携版 Python 并安装全部依赖（首次约 5–15 分钟，需要联网；所有文件都装在本目录的 `runtime` 文件夹里，不会改动系统）；
+3. 安装过程中会询问是否附带安装 Cellpose 深度学习分割（约 1–2 GB，可跳过，经典分割不受影响）；
+4. 完成后双击 `open_FluoQuant.bat` 启动。安装中断或失败时重新运行安装脚本即可，已完成的步骤会自动跳过。
+
+已有 Python 环境的用户可跳过安装脚本，直接 `pip install -r requirements.txt` 后运行 `python fluoquant.py`。
+
 双击 `open_FluoQuant.bat` 打开完整分析界面。
 
 ## 基本流程

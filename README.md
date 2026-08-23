@@ -1,6 +1,8 @@
 # FluoQuant
 
-A desktop GUI for quantitative fluorescence microscopy: draw and edit ROIs, extract line-scan intensity profiles from any number of channels, segment cells (classical or Cellpose), and export publication-ready panels and per-cell statistics. Formerly known as "Fluorescence Line-scan Analyzer".
+A desktop GUI for quantitative fluorescence microscopy: draw and edit ROIs, extract line-scan intensity profiles from any number of channels, segment cells (classical or Cellpose), and export publication-ready panels and per-cell statistics.
+
+> **Former names** (kept here for searchability): *Fluorescence Line-scan Analyzer* (`fluorescence_linescan_analyzer.py`), originally *HNF4A line-scan GUI* (`hnf4a_linescan_gui.py`). Same tool, renamed to FluoQuant as its scope grew beyond line scans.
 
 ![Application interface](gui_interface_preview_v2.png)
 
@@ -28,7 +30,9 @@ The software does not assign biological names to channels. After importing an im
 
 ## Installation
 
-Python 3.10 or later is recommended.
+**No Python on the machine?** Double-click `install_FluoQuant.bat`: it downloads a portable Python into the local `runtime` folder and installs every dependency there (5–15 min, internet required, nothing outside the folder is touched). Cellpose is offered as an optional extra during installation. Then launch with `open_FluoQuant.bat`.
+
+**With an existing Python** (3.10 or later recommended):
 
 ```powershell
 python -m venv .venv
