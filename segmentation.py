@@ -461,6 +461,19 @@ def measure_cells_dual(
     return header, rows
 
 
+def colorize_labels(labels: np.ndarray) -> np.ndarray:
+    """Map a label mask to distinct pseudocolors (uint8 RGB, black bg)."""
+    import colorsys
+
+    count = int(labels.max())
+    palette = np.zeros((count + 1, 3), dtype=np.uint8)
+    for position in range(1, count + 1):
+        hue = (position * 0.61803398875) % 1.0
+        red, green, blue = colorsys.hsv_to_rgb(hue, 0.65, 1.0)
+        palette[position] = (int(red * 255), int(green * 255), int(blue * 255))
+    return palette[labels]
+
+
 def make_segmentation_overlay(
     composite_rgb: np.ndarray,
     result: SegmentationResult,
@@ -530,10 +543,18 @@ def export_segmentation(
         label_dtype = np.uint16 if result.count < 65536 else np.int32
         tifffile.imwrite(labels_path, result.labels.astype(label_dtype))
         exported["labels"] = labels_path
+        colored_path = output_dir / f"{stem}_labels_colored.png"
+        Image.fromarray(colorize_labels(result.labels)).save(colored_path, dpi=(300, 300))
+        exported["labels_colored"] = colored_path
         if result.nucleus_labels is not None:
             nuclei_path = output_dir / f"{stem}_labels_nuclei.tif"
             tifffile.imwrite(nuclei_path, result.nucleus_labels.astype(label_dtype))
             exported["labels_nuclei"] = nuclei_path
+            nuclei_colored_path = output_dir / f"{stem}_labels_nuclei_colored.png"
+            Image.fromarray(colorize_labels(result.nucleus_labels)).save(
+                nuclei_colored_path, dpi=(300, 300)
+            )
+            exported["labels_nuclei_colored"] = nuclei_colored_path
 
     region_area_mm2 = (
         result.labels.shape[0] * result.labels.shape[1] * (pixel_size_um / 1000.0) ** 2
@@ -584,7 +605,8 @@ def export_segmentation(
         "measured_channels": [name for name, _data in channels],
         "summary": summary,
         "note": (
-            "labels.tif is the label mask (0 = background); cell_id in the CSV matches label values. "
+            "labels.tif is the label mask (0 = background); cell_id in the CSV matches label values; "
+            "labels_colored.png is a pseudocolor preview of the same mask for visual inspection. "
             "Single mode: perinuclear columns sample a ring grown outward from each segmented object; "
             "nuc_peri_ratio = object mean / ring mean (cytoplasm proxy, not a true N/C ratio). "
             "Dual mode: cyto columns are the true cytoplasm compartment (cell minus nucleus) and "

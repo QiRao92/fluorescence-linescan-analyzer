@@ -2569,6 +2569,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"分割结果已导出 {len(exported)} 个文件到 {folder}"
         )
+        self.open_output_folder()
 
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("文件")
@@ -3160,12 +3161,10 @@ class MainWindow(QMainWindow):
             paths = export_record(record, output_dir, selected)
             self.last_export_dir = output_dir
             self._update_controls()
-            self.statusBar().showMessage(f"已导出到：{output_dir}")
-            QMessageBox.information(
-                self,
-                "导出完成",
-                f"已按勾选生成 {len(paths)} 个文件。\n\n{output_dir}",
+            self.statusBar().showMessage(
+                f"已按勾选生成 {len(paths)} 个文件：{output_dir}"
             )
+            self.open_output_folder()
         except Exception as error:
             QMessageBox.critical(self, "导出失败", str(error))
 
@@ -3204,7 +3203,8 @@ class MainWindow(QMainWindow):
         if errors:
             QMessageBox.warning(self, "批量导出完成（有错误）", "\n".join(errors))
         else:
-            QMessageBox.information(self, "批量导出完成", f"结果已保存到：\n{output_dir}")
+            self.statusBar().showMessage(f"批量导出完成：{output_dir}")
+        self.open_output_folder()
 
     def open_output_folder(self) -> None:
         if self.last_export_dir is None:
