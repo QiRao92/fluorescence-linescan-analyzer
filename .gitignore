@@ -9,4 +9,7 @@
 !segmentation.py
 !open_FluoQuant.bat
 !install_FluoQuant.bat
+!open_FluoQuant.command
+!install_FluoQuant.command
+!.gitattributes
 !gui_interface_preview_v2.png

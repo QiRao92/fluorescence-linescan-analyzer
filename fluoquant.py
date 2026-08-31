@@ -3209,10 +3209,12 @@ class MainWindow(QMainWindow):
     def open_output_folder(self) -> None:
         if self.last_export_dir is None:
             return
-        try:
+        if sys.platform.startswith("win"):
             os.startfile(self.last_export_dir)  # type: ignore[attr-defined]
-        except AttributeError:
-            subprocess.Popen(["explorer", str(self.last_export_dir)])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(self.last_export_dir)])
+        else:
+            subprocess.Popen(["xdg-open", str(self.last_export_dir)])
 
     def show_help(self) -> None:
         QMessageBox.information(

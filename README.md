@@ -30,7 +30,9 @@ The software does not assign biological names to channels. After importing an im
 
 ## Installation
 
-**No Python on the machine?** Double-click `install_FluoQuant.bat`: it downloads a portable Python into the local `runtime` folder and installs every dependency there (5–15 min, internet required, nothing outside the folder is touched). Cellpose is offered as an optional extra during installation. Then launch with `open_FluoQuant.bat`.
+**No Python on the machine?** On Windows, double-click `install_FluoQuant.bat`: it downloads a portable Python into the local `runtime` folder and installs every dependency there (5–15 min, internet required, nothing outside the folder is touched). Cellpose is offered as an optional extra during installation. Then launch with `open_FluoQuant.bat`.
+
+**macOS**: double-click `install_FluoQuant.command` (creates a self-contained venv in `runtime_mac`; requires a system `python3`), then launch with `open_FluoQuant.command`. If Gatekeeper blocks the script, right-click → Open; if double-clicking does nothing, run `chmod +x *.command` once in Terminal.
 
 **With an existing Python** (3.10 or later recommended):
 

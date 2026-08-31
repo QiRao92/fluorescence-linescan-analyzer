@@ -1,0 +1,6 @@
+# Windows batch files are GBK-encoded with CRLF; never normalize them.
+*.bat -text
+# macOS launchers must keep LF endings on every platform.
+*.command text eol=lf
+*.py text eol=lf
+*.md text eol=lf

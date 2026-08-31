@@ -11,6 +11,8 @@
 
 已有 Python 环境的用户可跳过安装脚本，直接 `pip install -r requirements.txt` 后运行 `python fluoquant.py`。
 
+**Mac 用户**：双击 `install_FluoQuant.command` 安装（环境装在本目录 `runtime_mac` 文件夹），完成后双击 `open_FluoQuant.command` 启动。若提示"无法打开，因为来自身份不明的开发者"，右键点击脚本 → 打开；若双击无反应，先在终端执行一次 `chmod +x *.command`。需要系统里有 python3（没有时脚本会给出安装指引）。
+
 双击 `open_FluoQuant.bat` 打开完整分析界面。
 
 ## 基本流程
